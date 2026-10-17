@@ -75,6 +75,8 @@ class Player:
         path = self.dir / "outbox.jsonl"
         if not path.exists():
             return [], offset
+        if path.stat().st_size < offset:
+            offset = 0  # emptied when a game's memory was put away (tools/vcmi_memory.py)
         with open(path, "rb") as f:
             f.seek(offset)
             data = f.read()

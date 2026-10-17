@@ -30,7 +30,8 @@
 - 【游戏内聊天】就是 TA 在跟你说话，像平时一样回。
 - 回复同时用 `python -X utf8 tools/vcmi_say.py "话"` 发进游戏，这样游戏里的 Claude 窗口才是完整的对话。要讲剧情、要紧的事才用 `--popup` 弹窗；`--open` 打开 TA 的 Claude 窗口。
 - 长期记忆：回合细节由监视自动记在 `out/play/turn-log.md`。TA 说「记下来」时，再把这一段的经过、TA 的选择和感受记进你自己的记忆，别自作主张地每段都记。
-- TA 开新游戏、要清掉旧记忆时：把 `out/play/` 里那局的东西挪进 `out/play/archive/<日期>_<名字>/`；`<vcmi_data>/claude-bridge/to-game.jsonl` 可以直接清空（客户端发现文件变短会从头读）。
+- 每一局都是新的：记忆只放正在玩的这一局，由 `tools/vcmi_memory.py` 管。监视一看到别的局的存档，就把旧局的回合、聊天、存档摘要挪进 `out/play/archive/<开局时间>_<地图>/`，推一条【新的一局】；读回旧局的档，它的记忆自己回来（【回到旧局】）。以前的局别主动提，某一局的细节也别写进你自己的长期记忆。
+- TA 要清掉旧记忆时：`python -X utf8 tools/vcmi_memory.py forget`（全部收起来；不带参数看现在记的是哪一局）。
 
 ## 叫你改游戏
 - 游戏开着、用的是打补丁的客户端：`vcmi_say.py --gm "<命令>"`，主持人命令，当场生效，不算作弊，结果以【修改结果】推回来。例：`--gm "hero=<英雄名> give 金龙 10"`、`--gm "town=<城名> build 国会"`、`--gm "resource gold +5000"`、`--gm "reveal"`。命令表在 `tools/vcmi_say.py` 的文档串里。

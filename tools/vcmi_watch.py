@@ -19,6 +19,10 @@ Saves are only read. Each digest also goes to out/play/latest.md, with the full
 state (vcmi_save --brief) underneath, and the JSON of every save read is kept in
 out/play/saves/. Saves come from <vcmi_data>/Saves and <claude-bridge>/remote-saves
 (tools/h3tools/config.py).
+
+Memory is kept for one game at a time (tools/vcmi_memory.py): when a save of another game
+turns up, the old game's turns, chat and notes are put away first, and the digest says so
+(【新的一局】, or 【回到旧局】 when an archived game is loaded again).
 """
 from __future__ import annotations
 
@@ -30,6 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vcmi_local  # noqa: E402
+import vcmi_memory  # noqa: E402
 import vcmi_save  # noqa: E402
 import vcmi_say  # noqa: E402
 
@@ -54,7 +59,7 @@ def short(text: str | None, n: int = 60) -> str:
 
 def save_key(d: dict) -> tuple:
     m = d["map"]
-    return (m.get("campaign"), m.get("scenario"), m["name"])
+    return ((d.get("game") or {}).get("started"), m.get("campaign"), m.get("scenario"), m["name"])
 
 
 def where(m: dict) -> str:
@@ -119,11 +124,11 @@ def diff_hero(old: dict | None, new: dict, label: str = "新英雄") -> list[str
     return out
 
 
-def digest(old: dict | None, new: dict, path: Path) -> list[str]:
+def digest(old: dict | None, new: dict, path: Path, first: str | None = None) -> list[str]:
     """Short lines describing new (and what changed since old, a save of the same map)."""
     head = f"【第 {new['day']} 天】{where(new['map'])}  存档 {path.parent.name}/{path.name}"
     if old is None:
-        lines = [head + "（开始跟踪，之前的回合看不到）"]
+        lines = [head + (first or "（开始跟踪，之前的回合看不到）")]
     elif old["day"] == new["day"] and old == new:
         return [head + "（和上一个存档一样）"]
     else:
@@ -279,10 +284,13 @@ class Watcher:
             emit(["【陪玩就绪】还没有存档；开一局后每回合的自动存档会推送过来"])
         else:
             newest = max(current, key=current.get)
-            d = self.read(newest)
-            if d is None:
+            d = None if vcmi_memory.stale(newest) else self.read(newest)
+            if vcmi_memory.stale(newest):
+                emit(["【陪玩就绪】记忆是空的（上一局已经收起来了）；玩家开新局或读档以后，每回合的存档会推送过来"])
+            elif d is None:
                 emit([f"【陪玩就绪】最新存档 {newest} 读不出来"])
             else:
+                self.switch_game(d, newest)
                 self.last[save_key(d)] = newest
                 publish(digest(None, d, newest), d, newest, "【陪玩就绪】")
         self.save_state()
@@ -300,8 +308,9 @@ class Watcher:
                     changed = True
                 continue
             self.seen[path] = mtime
+            switched = self.switch_game(d, path)
             key = save_key(d)
-            lines = digest(self.previous(key), d, path)
+            lines = digest(self.previous(key), d, path, "（换了一局，这是它的第一个存档）" if switched else None)
             if self.skipped > 0:
                 lines[0] += f"（没在看的时候还存了 {self.skipped} 次，合在这一条里）"
                 self.skipped = 0
@@ -312,6 +321,14 @@ class Watcher:
             changed = True
         if changed:
             self.save_state()
+
+    def switch_game(self, d: dict, path: Path) -> bool:
+        """Every game is a new game: put the old one's memory away before this save is reported."""
+        lines = vcmi_memory.switch(vcmi_memory.game_of(d, path))
+        if lines:
+            self.events = []  # the end of the old game
+            emit(lines)
+        return bool(lines)
 
     def poll_chat(self) -> bool:
         if not FROM_GAME.exists():
@@ -375,34 +392,24 @@ def publish(lines: list[str], d: dict, path: Path, tag: str = "") -> None:
     emit(lines + [f"（详情 {detail.relative_to(ROOT).as_posix()}）"])
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    try:
-        raw_lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    out = []
-    for raw in raw_lines:
-        try:
-            out.append(json.loads(raw))
-        except json.JSONDecodeError:
-            continue
-    return out
-
-
 def recap(turns: int, chats: int) -> list[str]:
     """What a fresh Claude session needs to pick up the game: the last turns and the last
-    things said in the Claude window, in both directions."""
+    things said in the Claude window, in both directions. Only the game of the newest save:
+    other games are put away first (tools/vcmi_memory.py)."""
+    lines = vcmi_memory.sync()
+    game = vcmi_memory.current()
+    if game:
+        lines.append(f"【这一局】{vcmi_memory.describe(game)}。每一局都是新的：只说这局的事，以前的局不提。")
+    elif vcmi_memory.load():
+        lines.append("【这一局】还没开始：以前的局都收起来了，记忆是空的。等玩家开新局，以前的局不提。")
     blocks = [b for b in TURN_LOG.read_text(encoding="utf-8").split("\n\n")
               if b.strip() and not b.startswith("【补记】")] if TURN_LOG.exists() else []
-    lines = []
-    if BIBLE.exists():  # private story notes; public copies of the tools don't have them
-        lines.append("【恢复记忆】剧情上的选择和每章的经过见 docs/story/bible.md「游玩记录」。")
+    if BIBLE.exists() and game and "<!-- game: " in BIBLE.read_text(encoding="utf-8"):
+        # private story notes; public copies of the tools don't have them
+        lines.append("【恢复记忆】这局（和同一战役前几章）玩家让存的经过和选择见 docs/story/bible.md「游玩记录」。")
     lines.append(f"最近 {min(turns, len(blocks))} 个回合（共记了 {len(blocks)} 个）：")
     lines += blocks[-turns:] or ["（还没有回合记录）"]
-    bridge = vcmi_say.bridge_dir()
-    talk = [m for m in read_jsonl(bridge / "to-game.jsonl") + read_jsonl(bridge / "from-game.jsonl")
-            if m.get("kind", "chat") in ("chat", "popup") and m.get("text")]
-    talk.sort(key=lambda m: str(m.get("ts", "")))
+    talk = [m for m in vcmi_memory.talk() if m.get("kind", "chat") in ("chat", "popup") and m.get("text")]
     lines.append(f"Claude 窗口里最近 {min(chats, len(talk))} 句（共 {len(talk)} 句）：")
     lines += [f"[{m.get('ts', '?')}] {m.get('from', '?')}：{m['text']}" for m in talk[-chats:]] or ["（还没聊过）"]
     return lines

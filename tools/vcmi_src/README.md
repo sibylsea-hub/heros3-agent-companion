@@ -78,6 +78,7 @@ conan install . --output-folder=<vcmi_build_root>\conan-generated --build=never 
 ## 存档 JSON
 `vcmi_save_reader <存档> [-o out.json] [--full-text] [--log 文件]`，或者用 `python -X utf8 tools/vcmi_save.py`。
 - `day / week / month / day_of_week`、`acting_players`、`map`（名字、文件、尺寸；战役还有 `campaign`、`scenario`，从 0 数）。
+- `game.started`：这一局的开局时间（本地时间，`2026-10-17T03:54:27` 这样）。服务器开新局、开战役的一章时盖上，这局的每个存档（包括手动存档）都带着，VCMI 的自动存档文件夹也按它命名。`vcmi_memory.py` 靠它分出哪些记忆属于哪一局。
 - `players[]`：颜色、是否人类、状态、资源；`heroes[]`（名字、类型、**站立格** `pos`、等级、经验、四项主属性（含宝物加成）与基础值、魔法、行动力、二级技能、部队、穿戴宝物、背包、法术书）；`towns[]`（名字、种族、入口格、已建建筑、驻军、驻守/来访英雄）；`visited_objects`、`destroyed_objects`、`quest_log`（物件 id）。
 - `story_objects[]`：告示牌、事件、先知小屋、任务守卫、潘多拉、宝物、监狱、带留言的怪物……以原始地图为准，每个都给 `present`（还在不在地图上）、`visited_by`、文本（默认截 180 字），先知/守卫给任务状态（`active_for` 已接、`completed`）。
 - `removed_objects[]`：原始地图上有、现在没了的所有物件（捡走的资源、打掉的怪、触发过的事件）。

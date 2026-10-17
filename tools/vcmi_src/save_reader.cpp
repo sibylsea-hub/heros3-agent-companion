@@ -320,6 +320,11 @@ JsonNode buildReport(CGameState & gs, IGameInfoCallback * mapCb)
 	out["map"]["size"].Vector().emplace_back(static_cast<int32_t>(map.width));
 	out["map"]["size"].Vector().emplace_back(static_cast<int32_t>(map.height));
 	out["map"]["size"].Vector().emplace_back(static_cast<int32_t>(map.levels()));
+	// Which game this is: the server stamps the start time when a game or campaign chapter
+	// starts, and every save of that game keeps it (autosave folders are named after it too).
+	// Local time, the same format as the claude-bridge "ts" fields.
+	const StartInfo * initial = gs.getInitialStartInfo() ? gs.getInitialStartInfo() : si;
+	out["game"]["started"].String() = vstd::getFormattedDateTime(initial->startTime, "%Y-%m-%dT%H:%M:%S");
 	if(si->campState)
 	{
 		out["map"]["campaign"].String() = si->campState->getNameTranslated();
