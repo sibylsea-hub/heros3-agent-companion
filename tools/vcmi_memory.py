@@ -18,6 +18,8 @@ Usage:
   python -X utf8 tools/vcmi_memory.py sync         # switch to the game of the newest save now
   python -X utf8 tools/vcmi_memory.py forget       # put everything away; the next game starts empty
   python -X utf8 tools/vcmi_memory.py note TEXT    # add a line to this game's 游玩记录 entry
+  python -X utf8 tools/vcmi_memory.py search WORD [WORD ...] [--all]
+                                                   # every game's turns, chat and notes with all the words
 """
 from __future__ import annotations
 
@@ -458,6 +460,72 @@ def note(text: str) -> str:
     return f"记进了 {BIBLE.name}「{NOTES[3:]}」·{g['map']}"
 
 
+def search(terms: list[str], per_game: int = 12) -> list[str]:
+    """Lines of every game's memory (this game, then the archive, newest first) that contain all
+    terms: turn digests, what was said and what happened in the game, 游玩记录 entries.
+    Other games are for when she asks about them; they are not brought up otherwise."""
+    want = [t.casefold() for t in terms]
+
+    def hit(s: str) -> bool:
+        s = s.casefold()
+        return all(t in s for t in want)
+
+    def cut(s: str, n: int = 110) -> str:
+        s = " ".join(str(s).split())
+        return s if len(s) <= n else s[:n] + "…"
+
+    def scan(turns: str, chats: list[dict], notes_text: str) -> list[str]:
+        out = []
+        for b in blocks(turns):
+            head, *rest = b.split("\n")
+            found = [x for x in rest if hit(x)]
+            if hit(head) or found:
+                out.append("  " + cut(head.split("  存档")[0], 60))
+                out += ["    " + cut(x) for x in found]
+        for m in chats:
+            if hit(str(m.get("text", ""))):
+                who = "游戏里" if m.get("kind") == "event" else m.get("from", "?")
+                out.append(f"  [{m.get('ts', '?')}] {who}：{cut(m['text'])}")
+        for e in entries(notes_text):
+            out += ["  游玩记录：" + cut(x.lstrip("- ")) for x in e.split("\n")[1:] if x.strip() and hit(x)]
+        return out
+
+    def chats_in(paths: list[Path]) -> list[dict]:
+        out = []
+        for p in paths:
+            for raw in read_lines(p):
+                try:
+                    out.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    pass
+        return sorted(out, key=lambda m: str(m.get("ts", "")))
+
+    cur = current()
+    found: list[tuple[str, list[str]]] = []
+    bible = BIBLE.read_text(encoding="utf-8") if BIBLE.exists() else ""
+    here = scan(TURN_LOG.read_text(encoding="utf-8") if TURN_LOG.exists() else "", talk(),
+                "".join(notes(bible)) if bible else "")
+    if here:
+        found.append(("这一局" + (describe(cur) if cur else "（还没开局）"), here))
+    folders = [p for k, p in reversed(archives()) if not (cur and k == cur["key"])]
+    if (ARCHIVE / "unsorted").exists():
+        folders.append(ARCHIVE / "unsorted")
+    for p in folders:
+        text = lambda name: (p / name).read_text(encoding="utf-8") if (p / name).exists() else ""
+        lines = scan(text("turn-log.md"), chats_in([p / n for n in TALK[:2]]), text("游玩记录.md"))
+        if lines:
+            found.append((f"以前的局 {p.name}", lines))
+    if not found:
+        return [f"搜「{' '.join(terms)}」：没搜到。"]
+    out = [f"搜「{' '.join(terms)}」：{len(found)} 局里有（以前的局是她问起才说的，平时不提）"]
+    for label, lines in found:
+        out.append(f"▸ {label}")
+        out += lines[:per_game]
+        if len(lines) > per_game:
+            out.append(f"  …还有 {len(lines) - per_game} 行（--all 全列）")
+    return out
+
+
 def summary(what: list[str]) -> str:
     names = {"turn": "回合", "save": "存档摘要", "chat": "行聊天和事件", "seat": "条座位消息", "note": "条游玩记录"}
     return "，".join(f"{what.count(k)} {v}" if k in ("chat", "seat", "note") else f"{what.count(k)} 个{v}"
@@ -495,8 +563,9 @@ def status() -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("command", nargs="?", default="status", choices=["status", "sync", "forget", "note"])
+    ap.add_argument("command", nargs="?", default="status", choices=["status", "sync", "forget", "note", "search"])
     ap.add_argument("text", nargs="*")
+    ap.add_argument("--all", action="store_true", help="search: list every hit, not the first 12 per game")
     a = ap.parse_args()
     if a.command == "sync":
         lines = sync() or ["已经是最新存档那一局了。"]
@@ -507,6 +576,10 @@ def main() -> int:
         if not a.text:
             ap.error("note 要给一段话")
         lines = [note(" ".join(a.text))]
+    elif a.command == "search":
+        if not a.text:
+            ap.error("search 要给要搜的词")
+        lines = search(a.text, 10**9 if a.all else 12)
     else:
         lines = status()
     print("\n".join(lines))
