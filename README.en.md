@@ -1,8 +1,10 @@
-# Play Heroes of Might and Magic III with Claude
+# Play Heroes of Might and Magic III with your AI agent
 
 [中文（正本）](README.md)
 
-A patch and toolkit for [VCMI](https://vcmi.eu/), the open-source Heroes of Might and Magic III engine, that lets an AI agent (we use Claude) join your game: it chats with you in-game, follows your turns live, plays a color in hotseat as your ally or rival, changes the game on request without flagging you as a cheater, and writes complete maps with their own story events.
+A patch and toolkit for [VCMI](https://vcmi.eu/), the open-source Heroes of Might and Magic III engine, that lets an AI agent join your game: it chats with you in-game, follows your turns live, plays a color in hotseat as your ally or rival, changes the game on request without flagging you as a cheater, and writes complete maps with their own story events.
+
+Any agent that can run commands and read and write files on your PC should work: Claude Code, Codex, Gemini CLI and the like. The tools are plain command-line programs, and [`AGENTS.md`](AGENTS.md) tells the agent how to use them. Our own setup is Claude with Claude Code.
 
 Built by Sibyl and Claude for our own games and shared as-is. It works for us every day, but it is young and rough in places. The Chinese README is the primary version; the in-game UI that the patch adds is currently in Chinese only.
 
@@ -10,11 +12,13 @@ Built by Sibyl and Claude for our own games and shared as-is. It works for us ev
 
 ## Features
 
+The in-game window, tab and player seat are currently labelled "Claude" because that is what we use; they work the same with any agent, and the sender name shown in chat can be changed.
+
 **In-game chat.** A "Claude" tab on the adventure map opens a chat window. Unread replies blink on the tab and scroll through the chat bar; important messages can pop up as dialogs. Text typed there goes only to the agent, never to the game's cheat parser. The normal Tab chat is forwarded too.
 
 **Live turn reports.** VCMI autosaves at the start of every turn. A watcher reads each new save and reports what changed: where heroes moved, what they picked up, which story objects fired, battle results, level-ups, new buildings. The patched client also reports visits, event texts and battles as they happen. Reports only cover what the player has seen, so the agent doesn't spoil the map. Everything is logged locally, so a fresh agent session can catch up on the whole game.
 
-**The agent as a local player.** In the lobby, hand any computer color to Claude (or name a hotseat seat `Claude`). On its turn, the agent gets a text briefing and a numbered list of legal actions, and sends commands such as `move H1 12 14`, `build T1 marketplace`, `recruit T1 pixie max`, `hire T1 1`, `end`. Each command is validated, and failures come back with a reason. Pathfinding and combat use VCMI's own pathfinder and auto-battle. If the agent goes quiet for three minutes, the Nullkiller AI finishes the turn.
+**The agent as a local player.** In the lobby, hand any computer color to the agent with the "Claude" button (or name a hotseat seat `Claude`). On its turn, the agent gets a text briefing and a numbered list of legal actions, and sends commands such as `move H1 12 14`, `build T1 marketplace`, `recruit T1 pixie max`, `hire T1 1`, `end`. Each command is validated, and failures come back with a reason. Pathfinding and combat use VCMI's own pathfinder and auto-battle. If the agent goes quiet for three minutes, the Nullkiller AI finishes the turn.
 
 **Host commands that don't count as cheating.** While the game runs, the agent can add creatures, resources, artifacts, experience, skills, spells, mana, movement, buildings and recruits; reveal the map; or teleport a hero. It uses the same server calls as the cheat codes but never sets the cheater flag. A separate save editor does the same offline, and can clear an existing cheater flag.
 
@@ -48,12 +52,12 @@ VCMI can do much more without recompiling: mods can add artifacts, heroes, creat
    - **Don't buy the 2015 "HD Edition"**: it contains only Restoration of Erathia, and VCMI cannot run on it alone.
    - **GOG**: Heroes of Might and Magic 3: Complete, the copy VCMI's site recommends.
    - **Ubisoft Store**: also sells Complete.
-2. **An agent that can run commands on your PC.** We use [Claude Code](https://claude.com/claude-code) (a paid Claude plan). The tools are plain command-line programs that read and write local files, so other agents that read `AGENTS.md` should work too, but only Claude has been tested.
+2. **An agent that can run commands on your PC**, such as Claude Code, Codex or Gemini CLI. Live play needs a watcher running in the background: Claude Code's Monitor wakes the agent every turn; other agents can poll `out/play/latest.md` or run `tools/vcmi_watch.py --recap` when you ping them. We play with [Claude Code](https://claude.com/claude-code) (a paid Claude plan); it is the only combination we have played end to end, so reports from other agents are welcome.
 3. **Windows with Visual Studio 2022**, to build the patched client (about 15 minutes the first time). A prebuilt Windows package is planned.
 
 ## Install
 1. Install the game and [official VCMI](https://vcmi.eu/download/), and import the game data as VCMI's instructions describe.
-2. Clone this repository, open it in Claude Code and say "set this up following AGENTS.md". The agent writes your paths into `h3mod.local.json` (see [`h3mod.example.json`](h3mod.example.json)) and builds the client following [`tools/vcmi_src/README.md`](tools/vcmi_src/README.md).
+2. Clone this repository, open it with your agent and say "set this up following AGENTS.md". The agent writes your paths into `h3mod.local.json` (see [`h3mod.example.json`](h3mod.example.json)) and builds the client following [`tools/vcmi_src/README.md`](tools/vcmi_src/README.md).
 3. Start the game with `tools/vcmi_play.bat` and tell the agent to start following your game.
 
 Everything stays on your machine. The optional relay for iPad/iPhone listens only on your home network and requires a token.
@@ -63,8 +67,9 @@ Everything stays on your machine. The optional relay for iPad/iPhone listens onl
 | Path | Contents |
 |---|---|
 | `AGENTS.md` | Instructions for agents: setup, live play, map writing, where to explore |
+| `CLAUDE.md` | One line that points Claude Code to `AGENTS.md` |
 | `tools/vcmi_src/` | VCMI 1.7.5 patch and the save reader/editor (GPL) |
-| `tools/vcmi_*.py` | Save reader, live watcher, chat bridge, agent-as-player, relay |
+| `tools/vcmi_*.py` | Save reader, live watcher, per-game memory, chat bridge, agent-as-player, relay |
 | `tools/h3tools/` | Map/campaign I/O, layout compiler, placement API, renderer |
 | `examples/` | Example map |
 | `docs/authoring.md` | Map-writing workflow (Chinese) |
@@ -80,4 +85,4 @@ No original game files are included. Heroes of Might and Magic is a trademark of
 - **VCMI Chinese translation mod** by YueR.
 - **[vcmi-llm-opponent](https://github.com/SergiiMytakii/vcmi-llm-opponent)**: an earlier LLM opponent for VCMI that informed our agent-as-player design.
 
-Keywords: Heroes of Might and Magic III, HoMM3, Heroes 3, H3, VCMI, Shadow of Death, mod, map editor, h3m, AI companion, LLM agent, Claude, Claude Code
+Keywords: Heroes of Might and Magic III, HoMM3, Heroes 3, H3, VCMI, Shadow of Death, mod, map editor, h3m, AI companion, AI agent, LLM agent, Claude, Claude Code, Codex
