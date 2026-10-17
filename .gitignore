@@ -1,0 +1,17 @@
+# Your machine's paths (copy h3mod.example.json to h3mod.local.json)
+h3mod.local.json
+.h3mod-public
+
+# Original game data is copyrighted: never commit it
+*.lod
+*.snd
+*.vid
+*.VID
+
+# Generated maps, logs, screenshots; VCMI source and builds
+out/
+build/
+third_party/
+__pycache__/
+*.pyc
+.venv/

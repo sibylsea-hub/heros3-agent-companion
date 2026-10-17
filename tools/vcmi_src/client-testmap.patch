@@ -1,0 +1,4933 @@
+diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
+index 232538e..1edee91 100644
+--- a/client/CMakeLists.txt
++++ b/client/CMakeLists.txt
+@@ -56,6 +56,7 @@ set(vcmiclientcommon_SRCS
+ 	lobby/CBonusSelection.cpp
+ 	lobby/CCampaignInfoScreen.cpp
+ 	lobby/CLobbyScreen.cpp
++	lobby/ClaudeSeatsWindow.cpp
+ 	lobby/CSavingScreen.cpp
+ 	lobby/CScenarioInfoScreen.cpp
+ 	lobby/CSelectionBase.cpp
+@@ -190,6 +191,7 @@ set(vcmiclientcommon_SRCS
+ 	windows/wiki/WikiModContent.cpp
+ 	windows/wiki/WikiTownContent.cpp
+ 	windows/CWindowObject.cpp
++	windows/ClaudeChatWindow.cpp
+ 	windows/CreaturePurchaseCard.cpp
+ 	windows/GUIClasses.cpp
+ 	windows/InfoWindows.cpp
+@@ -214,6 +216,8 @@ set(vcmiclientcommon_SRCS
+ 	Client.cpp
+ 	ClientCommandManager.cpp
+ 	GameChatHandler.cpp
++	ClaudeBridge.cpp
++	ClaudePlayer.cpp
+ 	HeroMovementController.cpp
+ 	NetPacksClient.cpp
+ 	NetPacksLobbyClient.cpp
+@@ -284,6 +288,7 @@ set(vcmiclientcommon_HEADERS
+ 	lobby/CBonusSelection.h
+ 	lobby/CCampaignInfoScreen.h
+ 	lobby/CLobbyScreen.h
++	lobby/ClaudeSeatsWindow.h
+ 	lobby/CSavingScreen.h
+ 	lobby/CScenarioInfoScreen.h
+ 	lobby/CSelectionBase.h
+@@ -437,6 +442,7 @@ set(vcmiclientcommon_HEADERS
+ 	windows/wiki/WikiModContent.h
+ 	windows/wiki/WikiTownContent.h
+ 	windows/CWindowObject.h
++	windows/ClaudeChatWindow.h
+ 	windows/CreaturePurchaseCard.h
+ 	windows/GUIClasses.h
+ 	windows/InfoWindows.h
+@@ -466,6 +472,8 @@ set(vcmiclientcommon_HEADERS
+ 	ClientNetPackVisitors.h
+ 	HeroMovementController.h
+ 	GameChatHandler.h
++	ClaudeBridge.h
++	ClaudePlayer.h
+ 	LobbyClientNetPackVisitors.h
+ 	ServerRunner.h
+ 	resource.h
+diff --git a/client/CPlayerInterface.cpp b/client/CPlayerInterface.cpp
+index 81f2505..a449ec4 100644
+--- a/client/CPlayerInterface.cpp
++++ b/client/CPlayerInterface.cpp
+@@ -14,6 +14,9 @@
+ 
+ #include "Client.h"
+ #include "CServerHandler.h"
++#include "ClaudeBridge.h"
++#include "ClaudePlayer.h"
++#include "GameChatHandler.h"
+ #include "HeroMovementController.h"
+ #include "PlayerLocalState.h"
+ 
+@@ -240,7 +243,7 @@ void CPlayerInterface::playerStartsTurn(PlayerColor player)
+ 	{
+ 		waitWhileDialog();
+ 
+-		bool isHuman = cb->getStartInfo()->playerInfos.count(player) && cb->getStartInfo()->playerInfos.at(player).isControlledByHuman();
++		bool isHuman = cb->getStartInfo()->playerInfos.count(player) && ClaudePlayer::isPerson(cb->getStartInfo()->playerInfos.at(player)); // H3 Mod: Claude counts as AI here
+ 
+ 		if (makingTurn == false)
+ 			adventureInt->onEnemyTurnStarted(player, isHuman);
+@@ -311,7 +314,7 @@ void CPlayerInterface::yourTurn(QueryID queryID)
+ 
+ 	int humanPlayersCount = 0;
+ 	for(const auto & info : cb->getStartInfo()->playerInfos)
+-		if (info.second.isControlledByHuman())
++		if (ClaudePlayer::isPerson(info.second)) // H3 Mod: no hotseat hand-over dialog for Claude's seat
+ 			humanPlayersCount++;
+ 
+ 	bool hotseatWait = humanPlayersCount > 1;
+@@ -447,9 +450,48 @@ void CPlayerInterface::townRemoved(const CGTownInstance* town)
+ }
+ 
+ 
++namespace // H3 Mod local patch: tell Claude ("回声") what happens to the local player, see ClaudeBridge.h
++{
++std::map<BattleID, BattleSide> claudeBattleSides; // our side in each battle, from battleStart to battleEnd
++
++void tellClaude(const std::string & text)
++{
++	GAME->server().getGameChat().getClaudeBridge().onGameEvent(text);
++}
++
++std::string tileText(const int3 & tile)
++{
++	return "(" + std::to_string(tile.x) + ", " + std::to_string(tile.y) + ", " + std::to_string(tile.z) + ")";
++}
++
++std::string armyText(const CCreatureSet * army)
++{
++	std::vector<std::string> parts;
++	if(army)
++		for(const auto & slot : army->Slots())
++			if(slot.second && slot.second->getCreature())
++				parts.push_back(slot.second->getCreature()->getNamePluralTranslated() + "×" + std::to_string(slot.second->getCount()));
++	return parts.empty() ? "没有兵" : boost::algorithm::join(parts, "、");
++}
++
++std::string casualtiesText(const std::map<CreatureID, si32> & casualties)
++{
++	std::vector<std::string> parts;
++	for(const auto & [id, count] : casualties)
++	{
++		const auto * creature = id.toEntity(LIBRARY);
++		if(creature && id != CreatureID::ARROW_TOWERS)
++			parts.push_back(creature->getNamePluralTranslated() + "×" + std::to_string(count));
++	}
++	return parts.empty() ? "无" : boost::algorithm::join(parts, "、");
++}
++}
++
+ void CPlayerInterface::heroVisit(const CGHeroInstance * visitor, const CGObjectInstance * visitedObj, bool start)
+ {
+ 	EVENT_HANDLER_CALLED_BY_CLIENT;
++	if(start && visitor && visitedObj)
++		tellClaude(visitor->getNameTranslated() + " 拜访 " + visitedObj->getObjectName() + " " + tileText(visitedObj->visitablePos()));
+ 	if(start && visitedObj)
+ 	{
+ 		auto visitSound = visitedObj->getVisitSound(CRandomGenerator::getDefault());
+@@ -676,6 +718,14 @@ void CPlayerInterface::battleStartBefore(const BattleID & battleID, const CCreat
+ 
+ void CPlayerInterface::battleStart(const BattleID & battleID, const CCreatureSet *army1, const CCreatureSet *army2, int3 tile, const CGHeroInstance *hero1, const CGHeroInstance *hero2, BattleSide side, bool replayAllowed)
+ {
++	{
++		claudeBattleSides[battleID] = side;
++		const bool attacking = side == BattleSide::ATTACKER;
++		const CGHeroInstance * ours = attacking ? hero1 : hero2;
++		const CGHeroInstance * theirs = attacking ? hero2 : hero1;
++		const std::string enemy = (theirs ? theirs->getNameTranslated() + "（" : std::string()) + armyText(attacking ? army2 : army1) + (theirs ? "）" : "");
++		tellClaude((ours ? ours->getNameTranslated() : std::string("城里的守军")) + " 开战 " + tileText(tile) + "，对手：" + enemy);
++	}
+ 	EVENT_HANDLER_CALLED_BY_CLIENT;
+ 
+ 	bool useQuickCombat = settings["adventure"]["quickCombat"].Bool() || GAME->map().getMap()->battleOnly;
+@@ -836,6 +886,19 @@ void CPlayerInterface::activeStack(const BattleID & battleID, const CStack * sta
+ void CPlayerInterface::battleEnd(const BattleID & battleID, const BattleResult *br, QueryID queryID)
+ {
+ 	EVENT_HANDLER_CALLED_BY_CLIENT;
++	if(br && claudeBattleSides.count(battleID))
++	{
++		const BattleSide ours = claudeBattleSides[battleID];
++		const BattleSide theirs = ours == BattleSide::ATTACKER ? BattleSide::DEFENDER : BattleSide::ATTACKER;
++		claudeBattleSides.erase(battleID);
++		std::string outcome = br->winner == ours ? "赢了" : br->winner == BattleSide::NONE ? "平局" : "输了";
++		if(br->result == EBattleResult::ESCAPE)
++			outcome += br->winner == ours ? "（对方逃跑）" : "（逃跑）";
++		else if(br->result == EBattleResult::SURRENDER)
++			outcome += br->winner == ours ? "（对方投降）" : "（投降）";
++		tellClaude("战斗结束：" + outcome + "。我方损失 " + casualtiesText(br->casualties[ours]) + "；对方损失 " + casualtiesText(br->casualties[theirs])
++			+ "；经验 +" + std::to_string(br->exp[ours]));
++	}
+ 	if(isAutoFightOn || autofightingAI)
+ 	{
+ 		isAutoFightOn = false;
+@@ -998,6 +1061,8 @@ void CPlayerInterface::yourTacticPhase(const BattleID & battleID, int distance)
+ void CPlayerInterface::showInfoDialog(EInfoWindowMode type, const std::string &text, const std::vector<Component> & components, int soundID)
+ {
+ 	EVENT_HANDLER_CALLED_BY_CLIENT;
++	if(!text.empty())
++		tellClaude("消息：" + text);
+ 
+ 	bool autoTryHover = settings["gameTweaks"]["infoBarPick"].Bool() && type == EInfoWindowMode::AUTO;
+ 	auto timer = type == EInfoWindowMode::INFO ? 3000 : 4500; //Implement long info windows like in HD mod
+@@ -1085,6 +1150,8 @@ void CPlayerInterface::showYesNoDialog(const std::string &text, CFunctionList<vo
+ void CPlayerInterface::showBlockingDialog(const std::string &text, const std::vector<Component> &components, QueryID askID, const int soundID, bool selection, bool cancel, bool safeToAutoaccept)
+ {
+ 	EVENT_HANDLER_CALLED_BY_CLIENT;
++	if(!text.empty())
++		tellClaude("问：" + text);
+ 	waitWhileDialog();
+ 
+ 	movementController->requestMovementAbort();
+@@ -1377,7 +1444,9 @@ void CPlayerInterface::initializeHeroTownList()
+ 			localState->addOwnedTown(town);
+ 	}
+ 
+-	localState->deserialize(*cb->getPlayerState(playerID)->playerLocalSettings);
++	const PlayerState * playerState = cb->getPlayerState(playerID);
++	if(playerState) // null for the spectator interface of --testmap / --spectate
++		localState->deserialize(*playerState->playerLocalSettings);
+ 
+ 	if(adventureInt)
+ 		adventureInt->onHeroChanged(nullptr);
+diff --git a/client/CServerHandler.cpp b/client/CServerHandler.cpp
+index 3a6928a..457474b 100644
+--- a/client/CServerHandler.cpp
++++ b/client/CServerHandler.cpp
+@@ -40,6 +40,7 @@
+ #include "windows/GUIClasses.h"
+ 
+ #include "../lib/CConfigHandler.h"
++#include "../lib/constants/StringConstants.h"
+ #include "../lib/GameLibrary.h"
+ #include "../lib/texts/CGeneralTextHandler.h"
+ #include "../lib/ConditionalWait.h"
+@@ -874,15 +875,39 @@ ELoadMode CServerHandler::getLoadMode()
+ void CServerHandler::debugStartTest(std::string filename, bool save)
+ {
+ 	logGlobal->info("Starting debug test with file: %s", filename);
++	{
++		// The lobby selects the last used map/save on its own once its file list is
++		// ready, which can replace the test file after the loop below has finished.
++		Settings last = settings.write["general"][save ? "lastSave" : "lastMap"];
++		last->String() = ResourcePath(filename, save ? EResType::SAVEGAME : EResType::MAP).getName();
++	}
++	// --testmap-hotseat: more local players after the first one, e.g. "Claude" (see ClaudePlayer.h)
++	std::vector<std::string> names;
++	const std::string hotseat = settings["session"]["testmap-hotseat"].isString() ? settings["session"]["testmap-hotseat"].String() : "";
++	if(!hotseat.empty())
++	{
++		std::string first = settings["general"]["playerName"].String();
++		if(first == "Player")
++			first = LIBRARY->generaltexth->translate("core.genrltxt.434");
++		names.push_back(first);
++		std::vector<std::string> extra;
++		boost::split(extra, hotseat, boost::is_any_of(","));
++		for(auto & name : extra)
++		{
++			boost::algorithm::trim(name);
++			if(!name.empty())
++				names.push_back(name);
++		}
++	}
+ 	auto mapInfo = std::make_shared<CMapInfo>();
+ 	if(save)
+ 	{
+-		resetStateForLobby(EStartMode::LOAD_GAME, ESelectionScreen::loadGame, EServerMode::LOCAL, {});
++		resetStateForLobby(EStartMode::LOAD_GAME, ESelectionScreen::loadGame, EServerMode::LOCAL, names);
+ 		mapInfo->saveInit(ResourcePath(filename, EResType::SAVEGAME));
+ 	}
+ 	else
+ 	{
+-		resetStateForLobby(EStartMode::NEW_GAME, ESelectionScreen::newGame, EServerMode::LOCAL, {});
++		resetStateForLobby(EStartMode::NEW_GAME, ESelectionScreen::newGame, EServerMode::LOCAL, names);
+ 		mapInfo->mapInit(filename);
+ 	}
+ 	if(settings["session"]["donotstartserver"].Bool())
+@@ -900,10 +925,31 @@ void CServerHandler::debugStartTest(std::string filename, bool save)
+ 		setMapInfo(mapInfo);
+ 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+ 	}
+-	// "Click" on color to remove us from it
+-	setPlayer(myFirstColor());
+-	while(myFirstColor() != PlayerColor::CANNOT_DETERMINE)
+-		std::this_thread::sleep_for(std::chrono::milliseconds(50));
++	if(!settings["session"]["testmap-human"].Bool())
++	{
++		// "Click" on color to remove us from it
++		setPlayer(myFirstColor());
++		while(myFirstColor() != PlayerColor::CANNOT_DETERMINE)
++			std::this_thread::sleep_for(std::chrono::milliseconds(50));
++	}
++
++	// --testmap-claude: AI colours for Claude, like the lobby's 颜色和 Claude window (H3 Mod, see ClaudePlayer.h)
++	if(settings["session"]["testmap-claude"].isString() && !settings["session"]["testmap-claude"].String().empty())
++	{
++		std::vector<std::string> colors;
++		boost::split(colors, settings["session"]["testmap-claude"].String(), boost::is_any_of(","));
++		for(auto & name : colors)
++		{
++			boost::algorithm::trim(name);
++			const auto index = vstd::find_pos(GameConstants::PLAYER_COLOR_NAMES, name);
++			if(index < 0)
++				continue;
++			const PlayerColor color(static_cast<int>(index));
++			setPlayerName(color, "Claude");
++			for(int i = 0; i < 100 && (!si->playerInfos.count(color) || si->playerInfos.at(color).name != "Claude"); ++i)
++				std::this_thread::sleep_for(std::chrono::milliseconds(50));
++		}
++	}
+ 
+ 	while(true)
+ 	{
+diff --git a/client/ClaudeBridge.cpp b/client/ClaudeBridge.cpp
+new file mode 100644
+index 0000000..3491d02
+--- /dev/null
++++ b/client/ClaudeBridge.cpp
+@@ -0,0 +1,609 @@
++/*
++ * ClaudeBridge.cpp, H3 Mod local patch (not part of VCMI)
++ *
++ * License: GNU General Public License v2.0 or later
++ *
++ */
++#include "StdInc.h"
++#include "ClaudeBridge.h"
++
++#include "CPlayerInterface.h"
++#include "CServerHandler.h"
++#include "PlayerLocalState.h"
++#include "GameChatHandler.h"
++#include "GameEngine.h"
++#include "GameInstance.h"
++#include "adventureMap/CInGameConsole.h"
++#include "gui/WindowHandler.h"
++#include "render/IScreenHandler.h"
++
++#include <SDL_events.h>
++#include "windows/ClaudeChatWindow.h"
++
++#include "../lib/CThreadHelper.h"
++#include "../lib/StartInfo.h"
++#include "../lib/VCMIDirs.h"
++#include "../lib/callback/CCallback.h"
++#include "../lib/mapObjects/army/CArmedInstance.h"
++#include "../lib/json/JsonNode.h"
++#include "../lib/texts/TextOperations.h"
++
++#include <boost/beast/core.hpp>
++#include <boost/beast/http.hpp>
++#include <boost/locale/encoding_utf.hpp>
++
++namespace
++{
++namespace beast = boost::beast;
++namespace http = beast::http;
++using tcp = boost::asio::ip::tcp;
++
++const std::string claudeName = "Claude";
++
++std::string timestamp()
++{
++	std::time_t now = std::time(nullptr);
++	std::tm local{};
++#ifdef VCMI_WINDOWS
++	localtime_s(&local, &now);
++#else
++	localtime_r(&now, &local);
++#endif
++	char buffer[32];
++	std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &local);
++	return buffer;
++}
++
++std::string jsonString(const std::string & value)
++{
++	std::string out = "\"";
++	for(unsigned char c : value)
++	{
++		if(c == '"' || c == '\\')
++			out += '\\', out += static_cast<char>(c);
++		else if(c == '\n')
++			out += "\\n";
++		else if(c < 0x20)
++			out += boost::str(boost::format("\\u%04x") % static_cast<int>(c));
++		else
++			out += static_cast<char>(c);
++	}
++	return out + "\"";
++}
++
++/// One JSON object per line (JsonNode's writer always breaks lines)
++std::string jsonLine(const std::string & from, const std::string & text, const std::string & kind)
++{
++	return "{\"ts\": " + jsonString(timestamp()) + ", \"from\": " + jsonString(from) + ", \"text\": " + jsonString(text)
++		+ ", \"kind\": " + jsonString(kind) + "}";
++}
++
++std::vector<std::string> splitLines(const std::string & data)
++{
++	std::vector<std::string> lines;
++	std::istringstream stream(data);
++	for(std::string line; std::getline(stream, line);)
++	{
++		boost::algorithm::trim(line);
++		if(!line.empty())
++			lines.push_back(line);
++	}
++	return lines;
++}
++
++std::string utf8(const boost::filesystem::path & path)
++{
++#ifdef VCMI_WINDOWS
++	return boost::locale::conv::utf_to_utf<char>(path.generic_wstring());
++#else
++	return path.generic_string();
++#endif
++}
++
++std::string urlEncode(const std::string & value)
++{
++	static const char * hex = "0123456789ABCDEF";
++	std::string out;
++	for(unsigned char c : value)
++	{
++		const bool plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '/';
++		if(plain)
++			out += static_cast<char>(c);
++		else
++		{
++			out += '%';
++			out += hex[c >> 4];
++			out += hex[c & 15];
++		}
++	}
++	return out;
++}
++
++std::string readFile(const boost::filesystem::path & path)
++{
++	std::ifstream in(path.c_str(), std::ios::binary);
++	return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++}
++
++std::string playerName()
++{
++	try
++	{
++		if(GAME->interface() && GAME->interface()->cb)
++			return GAME->interface()->cb->getStartInfo()->playerInfos.at(GAME->interface()->playerID).name;
++	}
++	catch(const std::out_of_range &)
++	{
++		// spectator or no player yet
++	}
++	return "玩家";
++}
++
++std::map<boost::filesystem::path, std::time_t> scanSaves(const boost::filesystem::path & root)
++{
++	std::map<boost::filesystem::path, std::time_t> result;
++	boost::system::error_code ec;
++	for(boost::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
++	{
++		if(boost::algorithm::iequals(it->path().extension().string(), ".vsgm1"))
++		{
++			boost::system::error_code timeError;
++			const std::time_t time = boost::filesystem::last_write_time(it->path(), timeError);
++			if(!timeError)
++				result[it->path()] = time;
++		}
++	}
++	return result;
++}
++}
++
++ClaudeBridge::ClaudeBridge()
++{
++	// the key the server wants on host commands; a new one only when the file is missing
++	const auto keyFile = directory() / "host-key.txt";
++	try
++	{
++		if(boost::filesystem::exists(keyFile))
++		{
++			std::ifstream in(keyFile.c_str());
++			in >> hostKey;
++		}
++		if(hostKey.empty())
++		{
++			std::random_device random;
++			for(int i = 0; i < 4; ++i)
++				hostKey += boost::str(boost::format("%08x") % random());
++			boost::filesystem::create_directories(directory());
++			std::ofstream(keyFile.c_str()) << hostKey << "\n";
++		}
++	}
++	catch(const std::exception & e)
++	{
++		logGlobal->error("Claude bridge: no host key: %s", e.what());
++	}
++	thread = std::thread([this]() { run(); });
++}
++
++ClaudeBridge::~ClaudeBridge()
++{
++	stopping = true;
++	if(thread.joinable())
++		thread.join();
++}
++
++boost::filesystem::path ClaudeBridge::directory()
++{
++	if(const char * dir = std::getenv("VCMI_CLAUDE_BRIDGE"))
++		return boost::filesystem::path(dir);
++	return VCMIDirs::get().userDataPath() / "claude-bridge";
++}
++
++void ClaudeBridge::run()
++{
++	setThreadName("claudeBridge");
++	const auto configPath = directory() / "config.json";
++	boost::system::error_code ec;
++	if(boost::filesystem::exists(configPath, ec))
++	{
++		std::string url;
++		std::string token;
++		try
++		{
++			const std::string data = readFile(configPath);
++			const JsonNode config(data.data(), data.size(), "claude-bridge/config.json");
++			url = config["relay"].isString() ? config["relay"].String() : "";
++			token = config["token"].isString() ? config["token"].String() : "";
++		}
++		catch(const std::exception & e)
++		{
++			logGlobal->error("Claude bridge: cannot read %s: %s", configPath.string(), e.what());
++		}
++		if(!url.empty())
++		{
++			if(boost::algorithm::starts_with(url, "http://"))
++				url = url.substr(7);
++			url = url.substr(0, url.find('/'));
++			const auto colon = url.rfind(':');
++			Relay relay;
++			relay.host = url.substr(0, colon);
++			relay.port = colon == std::string::npos ? "8733" : url.substr(colon + 1);
++			relay.token = token;
++			runRelay(relay);
++			return;
++		}
++	}
++	runFiles();
++}
++
++void ClaudeBridge::runFiles()
++{
++	setLink(ELink::FILES, "本机直连");
++	const auto dir = directory();
++	const auto inbox = dir / "to-game.jsonl";
++	boost::system::error_code ec;
++	// only messages written after the client started count
++	uintmax_t offset = boost::filesystem::exists(inbox, ec) ? boost::filesystem::file_size(inbox, ec) : 0;
++
++	auto flushOutbox = [&]()
++	{
++		std::deque<std::string> lines;
++		{
++			std::lock_guard lock(mutex);
++			std::swap(lines, outbox);
++		}
++		if(lines.empty())
++			return;
++		boost::filesystem::create_directories(dir, ec);
++		std::ofstream out((dir / "from-game.jsonl").c_str(), std::ios::binary | std::ios::app);
++		for(const auto & line : lines)
++			out << line << '\n';
++	};
++
++	while(sleepFor(std::chrono::milliseconds(300)))
++	{
++		std::vector<std::string> lines;
++		if(boost::filesystem::exists(inbox, ec))
++		{
++			const uintmax_t size = boost::filesystem::file_size(inbox, ec);
++			if(!ec)
++			{
++				if(size < offset)
++					offset = 0; // file was truncated or replaced
++				if(size > offset)
++				{
++					std::ifstream in(inbox.c_str(), std::ios::binary);
++					in.seekg(static_cast<std::streamoff>(offset));
++					std::string chunk(static_cast<size_t>(size - offset), '\0');
++					in.read(chunk.data(), chunk.size());
++					chunk.resize(static_cast<size_t>(in.gcount()));
++					const size_t complete = chunk.rfind('\n'); // leave a half-written last line for later
++					if(complete != std::string::npos)
++					{
++						offset += complete + 1;
++						lines = splitLines(chunk.substr(0, complete));
++					}
++				}
++			}
++		}
++		flushOutbox();
++		dispatch(std::move(lines));
++
++		// tests only (tools/vcmi_dev_client.py, VCMI_CLAUDE_PLAYER_DEV): player/screenshot.request asks for a screenshot, also in menus
++		if(std::getenv("VCMI_CLAUDE_PLAYER_DEV") && boost::filesystem::exists(dir / "player" / "screenshot.request", ec))
++		{
++			boost::filesystem::remove(dir / "player" / "screenshot.request", ec);
++			if(ENGINE)
++				ENGINE->dispatchMainThread([]() { ENGINE->screenHandler().screenShot(); });
++		}
++		// tests only: player/ui.request, lines "click <x> <y>", clicks into the game window (the hidden test desktop has no mouse)
++		if(std::getenv("VCMI_CLAUDE_PLAYER_DEV") && boost::filesystem::exists(dir / "player" / "ui.request", ec))
++		{
++			const std::string requests = readFile(dir / "player" / "ui.request");
++			boost::filesystem::remove(dir / "player" / "ui.request", ec);
++			for(const auto & line : splitLines(requests))
++			{
++				int x = 0;
++				int y = 0;
++				if(std::sscanf(line.c_str(), "click %d %d", &x, &y) != 2)
++					continue;
++				SDL_Event event{};
++				event.type = SDL_MOUSEMOTION;
++				event.motion.x = x;
++				event.motion.y = y;
++				SDL_PushEvent(&event);
++				for(const Uint32 type : {SDL_MOUSEBUTTONDOWN, SDL_MOUSEBUTTONUP})
++				{
++					event = {};
++					event.type = type;
++					event.button.button = SDL_BUTTON_LEFT;
++					event.button.state = type == SDL_MOUSEBUTTONDOWN ? SDL_PRESSED : SDL_RELEASED;
++					event.button.clicks = 1;
++					event.button.x = x;
++					event.button.y = y;
++					SDL_PushEvent(&event);
++					std::this_thread::sleep_for(std::chrono::milliseconds(80));
++				}
++				std::this_thread::sleep_for(std::chrono::milliseconds(300));
++			}
++		}
++	}
++	flushOutbox();
++}
++
++static http::response<http::string_body> relayRequest(const std::string & host, const std::string & port, const std::string & token, http::verb verb, const std::string & target, std::string body = {})
++{
++	boost::asio::io_context io;
++	tcp::resolver resolver(io);
++	beast::tcp_stream stream(io);
++	stream.expires_after(std::chrono::seconds(30));
++	stream.connect(resolver.resolve(host, port));
++
++	http::request<http::string_body> request(verb, target, 11);
++	request.set(http::field::host, host);
++	request.set("X-Bridge-Token", token);
++	if(verb != http::verb::get)
++	{
++		request.set(http::field::content_type, "application/octet-stream");
++		request.body() = std::move(body);
++	}
++	request.prepare_payload();
++	http::write(stream, request);
++
++	beast::flat_buffer buffer;
++	http::response_parser<http::string_body> parser;
++	parser.body_limit(16 * 1024 * 1024);
++	http::read(stream, buffer, parser);
++	beast::error_code ec;
++	stream.socket().shutdown(tcp::socket::shutdown_both, ec);
++
++	auto response = parser.release();
++	if(response.result() != http::status::ok)
++		throw std::runtime_error("HTTP " + std::to_string(response.result_int()) + " " + response.body());
++	return response;
++}
++
++void ClaudeBridge::runRelay(const Relay & relay)
++{
++	setLink(ELink::CONNECTING, "正在连接电脑 " + relay.host);
++	auto send = [&relay](http::verb verb, const std::string & target, std::string body = {})
++	{
++		return relayRequest(relay.host, relay.port, relay.token, verb, target, std::move(body));
++	};
++
++	const auto saveRoot = VCMIDirs::get().userSavePath();
++	auto uploaded = scanSaves(saveRoot); // saves made before this run are old news
++	auto nextSaveScan = std::chrono::steady_clock::now();
++	int64_t offset = -1; // -1: start at the relay's current end
++
++	while(sleepFor(std::chrono::milliseconds(1000)))
++	{
++		std::vector<std::string> lines;
++		try
++		{
++			auto response = send(http::verb::get, "/to-game?offset=" + std::to_string(offset));
++			offset = std::stoll(std::string(response["X-Next-Offset"]));
++			lines = splitLines(response.body());
++
++			for(;;)
++			{
++				std::string line;
++				{
++					std::lock_guard lock(mutex);
++					if(outbox.empty())
++						break;
++					line = outbox.front();
++				}
++				send(http::verb::post, "/from-game", line);
++				std::lock_guard lock(mutex);
++				outbox.pop_front();
++			}
++
++			if(std::chrono::steady_clock::now() >= nextSaveScan)
++			{
++				nextSaveScan = std::chrono::steady_clock::now() + std::chrono::seconds(3);
++				for(const auto & [path, time] : scanSaves(saveRoot))
++				{
++					auto known = uploaded.find(path);
++					if(known != uploaded.end() && known->second == time)
++						continue;
++					if(std::time(nullptr) - time < 2)
++						continue; // the game may still be writing it
++					const std::string name = utf8(boost::filesystem::relative(path, saveRoot));
++					send(http::verb::put, "/save?name=" + urlEncode(name), readFile(path));
++					uploaded[path] = time;
++					logGlobal->info("Claude bridge: uploaded save %s", name);
++				}
++			}
++			setLink(ELink::CONNECTED, "已连上电脑 " + relay.host);
++		}
++		catch(const std::exception & e)
++		{
++			setLink(ELink::OFFLINE, "连不上电脑 " + relay.host + "，消息先存着");
++			logGlobal->debug("Claude bridge: %s", e.what());
++		}
++		dispatch(std::move(lines));
++	}
++}
++
++void ClaudeBridge::setLink(ELink value, const std::string & description)
++{
++	const ELink old = link.exchange(value);
++	{
++		std::lock_guard lock(mutex);
++		linkDescription = description;
++	}
++	if(old != value || value == ELink::FILES)
++		logGlobal->info("Claude bridge: %s", description);
++}
++
++bool ClaudeBridge::sleepFor(std::chrono::milliseconds duration)
++{
++	const auto until = std::chrono::steady_clock::now() + duration;
++	while(!stopping && std::chrono::steady_clock::now() < until)
++		std::this_thread::sleep_for(std::chrono::milliseconds(50));
++	return !stopping;
++}
++
++void ClaudeBridge::dispatch(std::vector<std::string> lines)
++{
++	if(ENGINE && (!lines.empty() || pendingCount > 0)) // no ENGINE in --headless
++		ENGINE->dispatchMainThread([this, lines]() { deliver(lines); });
++}
++
++void ClaudeBridge::deliver(std::vector<std::string> lines)
++{
++	pending.insert(pending.end(), lines.begin(), lines.end());
++	pendingCount = pending.size();
++	if(!GAME->interface() || !GAME->interface()->cingconsole || !GAME->server().client)
++		return; // not in a game yet: keep them until one is running
++
++	std::vector<std::string> todo;
++	std::swap(todo, pending);
++	pendingCount = 0;
++	bool changed = false;
++	for(const auto & line : todo)
++	{
++		std::string text;
++		std::string kind;
++		std::string from;
++		try
++		{
++			const JsonNode message(line.data(), line.size(), "claude-bridge/to-game.jsonl");
++			text = message["text"].isString() ? message["text"].String() : "";
++			kind = message["kind"].isString() ? message["kind"].String() : "chat";
++			from = message["from"].isString() ? message["from"].String() : claudeName;
++		}
++		catch(const std::exception & e)
++		{
++			logGlobal->error("Claude bridge: bad line %s: %s", line, e.what());
++			continue;
++		}
++
++		if(kind == "open")
++		{
++			if(!ENGINE->windows().topWindow<ClaudeChatWindow>())
++				ENGINE->windows().createAndPushWindow<ClaudeChatWindow>();
++			continue;
++		}
++		if(text.empty())
++			continue;
++		logGlobal->info("Claude bridge: %s from %s: %s", kind, from, text);
++
++		const std::string time = TextOperations::getCurrentFormattedTimeLocal();
++		if(kind == "gm")
++		{
++			// straight to the server, not through GameChatHandler: the key must not reach
++			// from-game.jsonl or an online lobby's chat
++			if(hostKey.empty())
++				logGlobal->error("Claude bridge: no host key, dropping %s", text);
++			else
++				GAME->interface()->cb->sendMessage("#host " + hostKey + " " + text, GAME->interface()->localState->getCurrentArmy());
++		}
++		else if(kind == "command")
++		{
++			// exactly as if the player typed it into the chat (cheat codes included)
++			injecting = true;
++			GAME->server().getGameChat().sendMessageGameplay(text);
++			injecting = false;
++		}
++		else if(kind == "popup")
++		{
++			history.push_back({from, text, time, false});
++			changed = true;
++			GAME->interface()->showInfoDialog(text, std::vector<std::shared_ptr<CComponent>>(), 0);
++		}
++		else
++		{
++			history.push_back({from, text, time, false});
++			unread++;
++			changed = true;
++			GAME->interface()->cingconsole->addMessage(time, from, text);
++		}
++	}
++	if(changed)
++		notify();
++}
++
++void ClaudeBridge::record(const std::string & text, const std::string & kind)
++{
++	std::lock_guard lock(mutex);
++	outbox.push_back(jsonLine(playerName(), text, kind));
++}
++
++void ClaudeBridge::onPlayerChat(const std::string & text)
++{
++	record(text, injecting ? "command" : "chat");
++	if(injecting)
++		return;
++	history.push_back({playerName(), text, TextOperations::getCurrentFormattedTimeLocal(), true});
++	notify();
++}
++
++void ClaudeBridge::onGameEvent(const std::string & text)
++{
++	if(!text.empty())
++		record(text, "event");
++}
++
++void ClaudeBridge::onSystemMessage(const std::string & text)
++{
++	if(boost::starts_with(text, "【Claude】") || boost::starts_with(text, "【回声】"))
++		record(text, "gm-result");
++}
++
++void ClaudeBridge::showLine(const std::string & from, const std::string & text)
++{
++	if(text.empty() || !GAME->interface() || !GAME->interface()->cingconsole)
++		return;
++	const std::string time = TextOperations::getCurrentFormattedTimeLocal();
++	history.push_back({from, text, time, false});
++	unread++;
++	GAME->interface()->cingconsole->addMessage(time, from, text);
++	notify();
++}
++
++void ClaudeBridge::sendFromWindow(const std::string & text)
++{
++	if(text.empty())
++		return;
++	record(text, "chat");
++	history.push_back({playerName(), text, TextOperations::getCurrentFormattedTimeLocal(), true});
++	notify();
++}
++
++const std::vector<ClaudeBridgeMessage> & ClaudeBridge::getHistory() const
++{
++	return history;
++}
++
++int ClaudeBridge::getUnreadCount() const
++{
++	return unread;
++}
++
++void ClaudeBridge::markRead()
++{
++	unread = 0;
++}
++
++void ClaudeBridge::setListener(std::function<void()> callback)
++{
++	listener = std::move(callback);
++}
++
++void ClaudeBridge::notify()
++{
++	if(listener)
++		listener();
++}
++
++ClaudeBridge::ELink ClaudeBridge::getLink() const
++{
++	return link;
++}
++
++std::string ClaudeBridge::getLinkDescription() const
++{
++	std::lock_guard lock(mutex);
++	return linkDescription;
++}
+diff --git a/client/ClaudeBridge.h b/client/ClaudeBridge.h
+new file mode 100644
+index 0000000..f88c500
+--- /dev/null
++++ b/client/ClaudeBridge.h
+@@ -0,0 +1,106 @@
++/*
++ * ClaudeBridge.h, H3 Mod local patch (not part of VCMI)
++ *
++ * License: GNU General Public License v2.0 or later
++ *
++ */
++#pragma once
++
++/// One line of the conversation between the local player and Claude
++struct ClaudeBridgeMessage
++{
++	std::string sender;
++	std::string text;
++	std::string time;
++	bool fromPlayer;
++};
++
++/// Chat between the local player and a Claude session outside the game.
++///
++/// Messages are JSON lines {"ts", "from", "text", "kind"} in <userDataPath>/claude-bridge/
++/// (VCMI_CLAUDE_BRIDGE overrides the folder):
++/// - to-game.jsonl: lines from Claude. kind "chat" (default) goes to the Claude window and the
++///   in-game console, "popup" opens an info dialog, "open" opens the Claude window, "command" is
++///   sent to the game chat as if the player typed it (cheat codes included), "gm" is a 主持人命令:
++///   sent to the server as "#host <key> <text>" (key: claude-bridge/host-key.txt, made on first
++///   run), which changes the game without marking anyone as a cheater
++///   (PlayerMessageProcessor::handleHostCommand). Its answer, a system message starting with
++///   【Claude】, comes back to Claude with kind "gm-result".
++/// - from-game.jsonl: what the player says, in the Claude window or the in-game chat; and, with
++///   kind "event", what happens to the player (visits, messages, questions, battles), so Claude
++///   knows the story so far. tools/vcmi_watch.py folds the events into its turn digests.
++///
++/// If claude-bridge/config.json names a relay ({"relay": "http://host:port", "token": "..."}),
++/// the same lines travel over HTTP to tools/vcmi_relay.py on the PC instead, and every new save
++/// under the save folder is uploaded there, so a phone or tablet can play along.
++class ClaudeBridge : boost::noncopyable
++{
++public:
++	enum class ELink
++	{
++		FILES,      // no relay configured: local files
++		CONNECTING, // relay configured, no answer yet
++		CONNECTED,
++		OFFLINE     // relay configured but unreachable or refusing; outgoing lines wait
++	};
++
++	ClaudeBridge();
++	~ClaudeBridge();
++
++	/// Main thread. The player sent text to the game chat (Tab console)
++	void onPlayerChat(const std::string & text);
++	/// Main thread. The player wrote to Claude in the Claude window: local only, never sent to the game server
++	void sendFromWindow(const std::string & text);
++	/// Something happened to the local player (see CPlayerInterface). Goes to Claude only, not to the Claude window
++	void onGameEvent(const std::string & text);
++	/// Main thread. Claude, playing a hotseat seat (ClaudePlayer), says something: Claude window and in-game console
++	void showLine(const std::string & from, const std::string & text);
++	/// A system message arrived; answers to host commands (【Claude】...) go back to Claude
++	void onSystemMessage(const std::string & text);
++
++	const std::vector<ClaudeBridgeMessage> & getHistory() const;
++	int getUnreadCount() const;
++	void markRead();
++	/// Called on the main thread whenever history or the unread count change
++	void setListener(std::function<void()> callback);
++
++	ELink getLink() const;
++	std::string getLinkDescription() const;
++
++	static boost::filesystem::path directory();
++
++private:
++	struct Relay
++	{
++		std::string host;
++		std::string port;
++		std::string token;
++	};
++
++	std::thread thread;
++	std::atomic<bool> stopping = false;
++	std::atomic<ELink> link = ELink::FILES;
++	std::string hostKey; // for "gm" lines, see above
++
++	mutable std::mutex mutex; // guards outbox and linkDescription
++	std::deque<std::string> outbox;
++	std::string linkDescription;
++
++	// main thread only
++	std::vector<ClaudeBridgeMessage> history;
++	std::vector<std::string> pending; // lines waiting until a game is running
++	std::atomic<size_t> pendingCount = 0;
++	int unread = 0;
++	bool injecting = false;
++	std::function<void()> listener;
++
++	void run();
++	void runFiles();
++	void runRelay(const Relay & relay);
++	void setLink(ELink value, const std::string & description);
++	bool sleepFor(std::chrono::milliseconds duration);
++	void dispatch(std::vector<std::string> lines);
++	void deliver(std::vector<std::string> lines);
++	void record(const std::string & text, const std::string & kind);
++	void notify();
++};
+diff --git a/client/ClaudePlayer.cpp b/client/ClaudePlayer.cpp
+new file mode 100644
+index 0000000..e18eed8
+--- /dev/null
++++ b/client/ClaudePlayer.cpp
+@@ -0,0 +1,1770 @@
++/*
++ * ClaudePlayer.cpp, H3 Mod local patch (not part of VCMI)
++ *
++ * License: GNU General Public License v2.0 or later
++ *
++ */
++#include "StdInc.h"
++#include "ClaudePlayer.h"
++
++#include "ClaudeBridge.h"
++#include "Client.h"
++#include "CServerHandler.h"
++#include "GameChatHandler.h"
++#include "GameEngine.h"
++#include "GameInstance.h"
++#include "render/Graphics.h"
++#include "render/IScreenHandler.h"
++
++#include "../lib/CCreatureHandler.h"
++#include "../lib/CThreadHelper.h"
++#include "../lib/ConditionalWait.h"
++#include "../lib/GameLibrary.h"
++#include "../lib/IGameSettings.h"
++#include "../lib/StartInfo.h"
++#include "../lib/VCMIDirs.h"
++#include "../lib/battle/BattleInfo.h"
++#include "../lib/callback/CCallback.h"
++#include "../lib/callback/CGameInterface.h"
++#include "../lib/entities/artifact/CArtifact.h"
++#include "../lib/entities/artifact/CArtifactInstance.h"
++#include "../lib/entities/building/CBuilding.h"
++#include "../lib/entities/faction/CTown.h"
++#include "../lib/entities/hero/CHeroClass.h"
++#include "../lib/gameState/CGameState.h"
++#include "../lib/json/JsonNode.h"
++#include "../lib/mapObjects/CGHeroInstance.h"
++#include "../lib/mapObjects/CGTownInstance.h"
++#include "../lib/mapObjects/army/CStackInstance.h"
++#include "../lib/mapping/CMap.h"
++#include "../lib/mapping/CMapHeader.h"
++#include "../lib/networkPacks/PacksForClient.h"
++#include "../lib/networkPacks/PacksForClientBattle.h"
++#include "../lib/networkPacks/PacksForServer.h"
++#include "../lib/pathfinder/CGPathNode.h"
++#include "../lib/pathfinder/PathfinderCache.h"
++#include "../lib/pathfinder/PathfinderOptions.h"
++#include "../lib/texts/CGeneralTextHandler.h"
++
++#include <vcmi/Faction.h>
++#include <vcmi/Skill.h>
++
++// Files in <claude-bridge>/player/ (one JSON object per line in the .jsonl files):
++//   inbox.jsonl    Claude -> game: {"id": "...", "lines": ["move H1 12 14", "end"]} (or "cmd": "one line")
++//   outbox.jsonl   game -> Claude: {"ts", "kind", "color", "day", "text", "id"?, "ok"?}
++//                  kind: turn (briefing at turn start), reply (answer to an inbox request, same id),
++//                  handover (Claude was silent, the AI plays the rest), turn-end (summary of the turn)
++//   briefing.md    the latest turn briefing
++//   state.json     {"seats": [{"color", "name", "turn", "handedOver", "day", "secondsLeft"}], "updated"}
++//   config.json    optional {"timeout": 180, "idleTimeout": 20, "listenerFresh": 900}
++//   listener.json  touched by tools/vcmi_claude_player.py; if nobody touched it lately, nobody is
++//                  listening and the AI takes the turn after idleTimeout instead of timeout
++// Only inbox lines written after the game started count.
++
++namespace
++{
++using Clock = std::chrono::steady_clock;
++
++const char * const colorNames[] = {"红", "蓝", "棕", "绿", "橙", "紫", "青", "粉"};
++
++std::string colorName(PlayerColor color)
++{
++	return color.isValidPlayer() && color.getNum() < 8 ? colorNames[color.getNum()] : "中立";
++}
++
++std::string timestamp()
++{
++	std::time_t now = std::time(nullptr);
++	std::tm local{};
++#ifdef VCMI_WINDOWS
++	localtime_s(&local, &now);
++#else
++	localtime_r(&now, &local);
++#endif
++	char buffer[32];
++	std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &local);
++	return buffer;
++}
++
++std::string jsonString(const std::string & value)
++{
++	std::string out = "\"";
++	for(unsigned char c : value)
++	{
++		if(c == '"' || c == '\\')
++			out += '\\', out += static_cast<char>(c);
++		else if(c == '\n')
++			out += "\\n";
++		else if(c < 0x20)
++			out += boost::str(boost::format("\\u%04x") % static_cast<int>(c));
++		else
++			out += static_cast<char>(c);
++	}
++	return out + "\"";
++}
++
++std::string pos(const int3 & p)
++{
++	return "(" + std::to_string(p.x) + "," + std::to_string(p.y) + "," + std::to_string(p.z) + ")";
++}
++
++/// hover texts and dialogs have line breaks and {colour} markup
++std::string oneLine(std::string text)
++{
++	boost::algorithm::replace_all(text, "\r", "");
++	boost::algorithm::replace_all(text, "{", "");
++	boost::algorithm::replace_all(text, "}", "");
++	std::vector<std::string> parts;
++	boost::split(parts, text, boost::is_any_of("\n"));
++	std::string out;
++	for(auto & part : parts)
++	{
++		boost::algorithm::trim(part);
++		if(part.empty())
++			continue;
++		if(!out.empty())
++			out += " · ";
++		out += part;
++	}
++	return out;
++}
++
++std::string lower(std::string s)
++{
++	boost::algorithm::to_lower(s);
++	return s;
++}
++
++bool isNumber(const std::string & s)
++{
++	return !s.empty() && std::all_of(s.begin(), s.end(), [](char c){ return c >= '0' && c <= '9'; });
++}
++
++/// "core:castle.tavern" -> "tavern"
++std::string shortKey(const std::string & key)
++{
++	const auto cut = key.find_last_of(".:");
++	return cut == std::string::npos ? key : key.substr(cut + 1);
++}
++
++std::string resourceName(int index)
++{
++	return LIBRARY->generaltexth->restypes[index];
++}
++
++const int resourceOrder[] = {GameResID::GOLD, GameResID::WOOD, GameResID::ORE, GameResID::MERCURY, GameResID::SULFUR, GameResID::CRYSTAL, GameResID::GEMS};
++
++std::string costText(const TResources & cost)
++{
++	std::string out;
++	for(int r : resourceOrder)
++	{
++		if(cost[r] == 0)
++			continue;
++		if(!out.empty())
++			out += "，";
++		out += resourceName(r) + " " + std::to_string(cost[r]);
++	}
++	return out.empty() ? "免费" : out;
++}
++
++std::string missingText(const TResources & cost, const TResources & have)
++{
++	TResources missing;
++	for(int r : resourceOrder)
++		missing[r] = std::max<TResource>(0, cost[r] - have[r]);
++	return costText(missing);
++}
++
++int affordable(const TResources & cost, const TResources & have)
++{
++	int count = std::numeric_limits<int>::max();
++	for(int r : resourceOrder)
++		if(cost[r] > 0)
++			count = std::min<int>(count, static_cast<int>(have[r] / cost[r]));
++	return count == std::numeric_limits<int>::max() ? 9999 : count;
++}
++
++std::string armyText(const CCreatureSet & army)
++{
++	std::string out;
++	for(const auto & [slot, stack] : army.Slots())
++	{
++		const CCreature * c = stack->getCreature();
++		if(!out.empty())
++			out += "，";
++		out += (c ? c->getNamePluralTranslated() : std::string("?")) + "×" + std::to_string(stack->getCount());
++	}
++	return out.empty() ? "（空）" : out;
++}
++
++int creatureCount(const CCreatureSet & army, CreatureID id)
++{
++	int count = 0;
++	for(const auto & [slot, stack] : army.Slots())
++		if(stack->getCreatureID() == id)
++			count += stack->getCount();
++	return count;
++}
++
++std::string buildingName(const CGTownInstance * town, BuildingID id)
++{
++	const auto & buildings = town->getTown()->buildings;
++	auto it = buildings.find(id);
++	return it == buildings.end() ? std::string() : it->second->getNameTranslated();
++}
++
++std::string buildingKey(const CGTownInstance * town, BuildingID id)
++{
++	const auto & buildings = town->getTown()->buildings;
++	auto it = buildings.find(id);
++	return it == buildings.end() ? std::to_string(id.getNum()) : shortKey(it->second->getJsonKey());
++}
++
++std::string playerLabel(const CGameState & gs, PlayerColor color)
++{
++	std::string label = colorName(color);
++	auto it = gs.getStartInfo()->playerInfos.find(color);
++	if(it != gs.getStartInfo()->playerInfos.end() && !it->second.name.empty())
++		label += " " + it->second.name;
++	return label;
++}
++
++boost::filesystem::path playerDir()
++{
++	return ClaudeBridge::directory() / "player";
++}
++
++void appendLine(const boost::filesystem::path & file, const std::string & line)
++{
++	boost::system::error_code ec;
++	boost::filesystem::create_directories(file.parent_path(), ec);
++	std::ofstream out(file.c_str(), std::ios::binary | std::ios::app);
++	out << line << '\n';
++}
++
++void writeAtomic(const boost::filesystem::path & file, const std::string & text)
++{
++	boost::system::error_code ec;
++	boost::filesystem::create_directories(file.parent_path(), ec);
++	auto temp = file;
++	temp += ".tmp";
++	{
++		std::ofstream out(temp.c_str(), std::ios::binary | std::ios::trunc);
++		out << text;
++	}
++	boost::filesystem::rename(temp, file, ec);
++	if(ec)
++		logGlobal->error("Claude player: cannot write %s: %s", file.string(), ec.message());
++}
++
++struct Config
++{
++	int timeout = 180;       // seconds without a command before the AI takes over
++	int idleTimeout = 20;    // the same when no Claude window has been around lately
++	int listenerFresh = 900; // listener.json younger than this: someone is listening
++};
++
++Config readConfig()
++{
++	Config config;
++	const auto path = playerDir() / "config.json";
++	boost::system::error_code ec;
++	if(boost::filesystem::exists(path, ec))
++	{
++		try
++		{
++			std::ifstream in(path.c_str(), std::ios::binary);
++			const std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++			const JsonNode node(data.data(), data.size(), "claude-bridge/player/config.json");
++			if(node["timeout"].isNumber())
++				config.timeout = static_cast<int>(node["timeout"].Integer());
++			if(node["idleTimeout"].isNumber())
++				config.idleTimeout = static_cast<int>(node["idleTimeout"].Integer());
++			if(node["listenerFresh"].isNumber())
++				config.listenerFresh = static_cast<int>(node["listenerFresh"].Integer());
++		}
++		catch(const std::exception & e)
++		{
++			logGlobal->error("Claude player: bad config.json: %s", e.what());
++		}
++	}
++	if(const char * value = std::getenv("VCMI_CLAUDE_PLAYER_TIMEOUT"))
++		config.timeout = std::max(5, std::atoi(value));
++	return config;
++}
++
++bool listenerAlive(const Config & config)
++{
++	boost::system::error_code ec;
++	const std::time_t touched = boost::filesystem::last_write_time(playerDir() / "listener.json", ec);
++	return !ec && std::time(nullptr) - touched < config.listenerFresh;
++}
++
++std::vector<std::string> splitWords(const std::string & line)
++{
++	std::vector<std::string> words;
++	boost::split(words, line, boost::is_any_of(" \t"), boost::token_compress_on);
++	words.erase(std::remove(words.begin(), words.end(), std::string()), words.end());
++	return words;
++}
++
++std::string joinFrom(const std::vector<std::string> & words, size_t first)
++{
++	std::string out;
++	for(size_t i = first; i < words.size(); ++i)
++		out += (out.empty() ? "" : " ") + words[i];
++	return out;
++}
++
++std::string buildingStateText(EBuildingState state)
++{
++	switch(state)
++	{
++	case EBuildingState::HAVE_CAPITAL: return "已经有一座都城了";
++	case EBuildingState::NO_WATER: return "这座城不靠水";
++	case EBuildingState::FORBIDDEN: return "这张地图不许建";
++	case EBuildingState::ADD_MAGES_GUILD: return "魔法公会已经到顶了";
++	case EBuildingState::ALREADY_PRESENT: return "已经建好了";
++	case EBuildingState::CANT_BUILD_TODAY: return "这座城今天已经建过一次了";
++	case EBuildingState::NO_RESOURCES: return "资源不够";
++	case EBuildingState::ALLOWED: return "可以建";
++	case EBuildingState::PREREQUIRES: return "前置建筑还没建";
++	case EBuildingState::MISSING_BASE: return "要先建低一级的";
++	case EBuildingState::TOWN_NOT_OWNED: return "这不是你的城";
++	default: return "建不了";
++	}
++}
++
++/// a command failed; the message says why
++struct Refused : public std::runtime_error
++{
++	using std::runtime_error::runtime_error;
++};
++}
++
++struct ClaudePlayer::Snapshot
++{
++	int day = 0;
++	TResources resources;
++	struct Hero
++	{
++		std::string name;
++		int3 position;
++		int level = 0;
++		std::string army;
++	};
++	struct Town
++	{
++		std::string name;
++		std::set<BuildingID> buildings;
++		std::string garrison;
++	};
++	std::map<ObjectInstanceID, Hero> heroes;
++	std::map<ObjectInstanceID, Town> towns;
++	std::map<ObjectInstanceID, std::string> owned;  // mines, dwellings, ...
++	std::map<ObjectInstanceID, std::string> others; // what we see of other players: heroes and towns
++};
++
++struct ClaudePlayer::Seat
++{
++	PlayerColor color;
++	std::string name;
++	std::shared_ptr<CCallback> cb;
++	std::shared_ptr<CGameInterface> standIn;
++
++	// written by the network thread under mx, taken by the worker
++	bool turnGiven = false;
++	QueryID turnQuery = QueryID::NONE;
++	bool turnEnded = false;
++	std::vector<std::string> events; // what happened to this colour, not told yet
++	bool commandRunning = false;
++	std::vector<std::string> commandEvents;
++
++	// worker thread only
++	bool myTurn = false;
++	bool handedOver = false;
++	int timeout = 180;
++	Clock::time_point lastActivity;
++	std::optional<Snapshot> turnStart;
++	std::optional<Snapshot> lastTurnEnd;
++	std::vector<std::string> actionList; // the numbered list from the last "actions"
++};
++
++namespace
++{
++using Seat = ClaudePlayer::Seat;
++using Snapshot = ClaudePlayer::Snapshot;
++
++Snapshot takeSnapshot(const CGameState & gs, const Seat & seat)
++{
++	Snapshot s;
++	s.day = seat.cb->getDate(Date::DAY);
++	s.resources = seat.cb->getResourceAmount();
++	for(const auto * h : seat.cb->getHeroesInfo())
++		s.heroes[h->id] = {h->getNameTranslated(), h->visitablePos(), static_cast<int>(h->level), armyText(*h)};
++	for(const auto * t : seat.cb->getTownsInfo())
++		s.towns[t->id] = {t->getNameTranslated(), t->getBuildings(), armyText(*t)};
++	for(const auto * obj : seat.cb->getMyObjects())
++		if(obj->ID != Obj::HERO && obj->ID != Obj::TOWN)
++			s.owned[obj->id] = obj->getObjectName() + " " + pos(obj->visitablePos());
++	for(const auto * obj : seat.cb->getAllVisitableObjs())
++	{
++		if(!obj->getOwner().isValidPlayer() || obj->getOwner() == seat.color)
++			continue;
++		if(obj->ID == Obj::HERO)
++		{
++			const auto * h = dynamic_cast<const CGHeroInstance *>(obj);
++			s.others[obj->id] = playerLabel(gs, obj->getOwner()) + " 的英雄 " + (h ? h->getNameTranslated() : obj->getObjectName()) + " 在 " + pos(obj->visitablePos());
++		}
++		else if(obj->ID == Obj::TOWN)
++		{
++			const auto * t = dynamic_cast<const CGTownInstance *>(obj);
++			s.others[obj->id] = playerLabel(gs, obj->getOwner()) + " 的城 " + (t ? t->getNameTranslated() : obj->getObjectName()) + " 在 " + pos(obj->visitablePos());
++		}
++	}
++	return s;
++}
++
++std::vector<std::string> diffSnapshots(const CGameState & gs, const Seat & seat, const Snapshot & a, const Snapshot & b)
++{
++	std::vector<std::string> out;
++	std::string res;
++	for(int r : resourceOrder)
++	{
++		const auto delta = b.resources[r] - a.resources[r];
++		if(delta == 0)
++			continue;
++		if(!res.empty())
++			res += "，";
++		res += resourceName(r) + " " + std::to_string(a.resources[r]) + "→" + std::to_string(b.resources[r]) + (delta > 0 ? "（+" : "（") + std::to_string(delta) + "）";
++	}
++	if(!res.empty())
++		out.push_back("资源：" + res);
++
++	for(const auto & [id, h] : b.heroes)
++	{
++		auto it = a.heroes.find(id);
++		if(it == a.heroes.end())
++		{
++			out.push_back("新英雄：" + h.name + "（" + std::to_string(h.level) + " 级）在 " + pos(h.position) + "，兵：" + h.army);
++			continue;
++		}
++		const auto & old = it->second;
++		if(h.level != old.level)
++			out.push_back(h.name + " 从 " + std::to_string(old.level) + " 级升到 " + std::to_string(h.level) + " 级");
++		if(h.position != old.position)
++			out.push_back(h.name + " 从 " + pos(old.position) + " 到了 " + pos(h.position));
++		if(h.army != old.army)
++			out.push_back(h.name + " 的兵：" + old.army + " → " + h.army);
++	}
++	for(const auto & [id, h] : a.heroes)
++		if(!b.heroes.count(id))
++			out.push_back("失去了英雄 " + h.name + "（上次在 " + pos(h.position) + "）");
++
++	for(const auto & [id, t] : b.towns)
++	{
++		auto it = a.towns.find(id);
++		if(it == a.towns.end())
++		{
++			out.push_back("得到了城镇 " + t.name);
++			continue;
++		}
++		const auto * town = seat.cb->getTown(id);
++		for(const auto & building : t.buildings)
++			if(!it->second.buildings.count(building) && town && !buildingName(town, building).empty())
++				out.push_back(t.name + " 建好了 " + buildingName(town, building));
++		if(t.garrison != it->second.garrison)
++			out.push_back(t.name + " 的驻军：" + it->second.garrison + " → " + t.garrison);
++	}
++	for(const auto & [id, t] : a.towns)
++		if(!b.towns.count(id))
++			out.push_back("失去了城镇 " + t.name);
++
++	for(const auto & [id, text] : b.owned)
++		if(!a.owned.count(id))
++			out.push_back("占了 " + text);
++	for(const auto & [id, text] : a.owned)
++		if(!b.owned.count(id))
++			out.push_back("丢了 " + text);
++
++	for(const auto & [id, text] : b.others)
++	{
++		auto it = a.others.find(id);
++		if(it == a.others.end())
++			out.push_back("看到 " + text);
++		else if(it->second != text)
++			out.push_back("现在 " + text);
++	}
++	for(const auto & [id, text] : a.others)
++		if(!b.others.count(id))
++			out.push_back("看不见了：" + text);
++	return out;
++}
++
++std::string dateText(const CCallback & cb)
++{
++	return "第 " + std::to_string(cb.getDate(Date::MONTH)) + " 月第 " + std::to_string(cb.getDate(Date::WEEK)) + " 周第 "
++		+ std::to_string(cb.getDate(Date::DAY_OF_WEEK)) + " 天（总第 " + std::to_string(cb.getDate(Date::DAY)) + " 天）";
++}
++
++std::string heroLine(const CGHeroInstance * h, int index)
++{
++	std::string out = "H" + std::to_string(index) + " " + h->getNameTranslated() + "（" + h->getHeroClass()->getNameTranslated() + "，" + std::to_string(h->level) + " 级）在 " + pos(h->visitablePos());
++	if(h->getVisitedTown())
++		out += std::string("，") + (h->isGarrisoned() ? "驻守" : "在城里：") + h->getVisitedTown()->getNameTranslated();
++	if(h->inBoat())
++		out += "，在船上";
++	out += "\n   行动力 " + std::to_string(h->movementPointsRemaining()) + "/" + std::to_string(h->movementPointsLimit()) + " · 魔法 " + std::to_string(h->mana) + "/" + std::to_string(h->manaLimit())
++		+ " · 攻 " + std::to_string(h->getPrimSkillLevel(PrimarySkill::ATTACK)) + " 防 " + std::to_string(h->getPrimSkillLevel(PrimarySkill::DEFENSE))
++		+ " 力 " + std::to_string(h->getPrimSkillLevel(PrimarySkill::SPELL_POWER)) + " 知 " + std::to_string(h->getPrimSkillLevel(PrimarySkill::KNOWLEDGE));
++	out += "\n   兵：" + armyText(*h);
++	std::string skills;
++	for(const auto & [skill, level] : h->secSkills)
++	{
++		if(!skill.hasValue())
++			continue;
++		static const char * levels[] = {"", "初级", "中级", "高级"};
++		skills += (skills.empty() ? "" : "，") + std::string(levels[std::clamp<int>(level, 0, 3)]) + skill.toEntity(LIBRARY)->getNameTranslated();
++	}
++	if(!skills.empty())
++		out += "\n   技能：" + skills;
++	std::string arts;
++	for(const auto & [slot, info] : h->artifactsWorn)
++	{
++		if(info.locked || !info.getArt() || slot.getNum() >= ArtifactPosition::MACH1)
++			continue;
++		arts += (arts.empty() ? "" : "，") + info.getArt()->getType()->getNameTranslated();
++	}
++	if(!h->artifactsInBackpack.empty())
++		arts += (arts.empty() ? "" : "，") + std::string("背包 ") + std::to_string(h->artifactsInBackpack.size()) + " 件";
++	if(!arts.empty())
++		out += "\n   宝物：" + arts;
++	return out;
++}
++
++struct RecruitOption
++{
++	int level;
++	CreatureID creature;
++	int available;
++};
++
++std::vector<RecruitOption> recruitOptions(const CGTownInstance * town)
++{
++	std::vector<RecruitOption> out;
++	for(int level = 0; level < static_cast<int>(town->creatures.size()); ++level)
++	{
++		const auto & [available, ids] = town->creatures[level];
++		for(const auto & id : ids)
++			out.push_back({level, id, static_cast<int>(available)});
++	}
++	return out;
++}
++
++std::vector<BuildingID> buildableNow(const CCallback & cb, const CGTownInstance * town, bool includePoor)
++{
++	std::vector<BuildingID> out;
++	for(const auto & [id, building] : town->getTown()->buildings)
++	{
++		if(id == BuildingID::GRAIL || building->getNameTranslated().empty())
++			continue; // the grail is built by bringing the grail; nameless ones are internal
++		const auto state = cb.canBuildStructure(town, id);
++		if(state == EBuildingState::ALLOWED || (includePoor && state == EBuildingState::NO_RESOURCES))
++			out.push_back(id);
++	}
++	return out;
++}
++
++struct Destination
++{
++	const CGObjectInstance * object;
++	int turns;
++	int moveRemains;
++};
++
++/// interesting visible objects a hero reaches within `maxTurns` more days, nearest first
++std::vector<Destination> destinations(const Seat & seat, const CGHeroInstance * hero, int maxTurns)
++{
++	PathfinderCache cache(seat.cb.get(), PathfinderOptions(*seat.cb));
++	auto paths = cache.getPathsInfo(hero);
++	std::vector<Destination> out;
++	for(const auto * obj : seat.cb->getAllVisitableObjs())
++	{
++		if(obj == hero || obj->visitablePos() == hero->visitablePos())
++			continue;
++		if(obj->getOwner() == seat.color && obj->ID != Obj::TOWN && obj->ID != Obj::HERO)
++			continue; // our own mines and dwellings
++		if(obj->ID == Obj::HERO && obj->getOwner() == seat.color)
++			continue;
++		const auto * node = paths->getPathInfo(obj->visitablePos());
++		if(!node || !node->reachable() || node->turns > maxTurns)
++			continue;
++		out.push_back({obj, node->turns, node->moveRemains});
++	}
++	std::sort(out.begin(), out.end(), [](const Destination & a, const Destination & b)
++	{
++		return a.turns != b.turns ? a.turns < b.turns : a.moveRemains > b.moveRemains;
++	});
++	return out;
++}
++
++std::string destinationText(const Destination & d, const CGHeroInstance * hero)
++{
++	return pos(d.object->visitablePos()) + " " + oneLine(d.object->getHoverText(hero));
++}
++}
++
++ClaudePlayer & ClaudePlayer::get()
++{
++	static ClaudePlayer instance;
++	return instance;
++}
++
++ClaudePlayer::ClaudePlayer() = default;
++
++ClaudePlayer::~ClaudePlayer()
++{
++	stopping = true;
++	if(worker.joinable())
++		worker.join();
++}
++
++bool ClaudePlayer::isClaudeName(const std::string & name)
++{
++	std::string n = name;
++	boost::algorithm::trim(n);
++	return boost::algorithm::istarts_with(n, "claude") || n == "回声";
++}
++
++bool ClaudePlayer::isPerson(const PlayerSettings & settings)
++{
++	return settings.isControlledByHuman() && !isClaudeName(settings.name);
++}
++
++void ClaudePlayer::attach(CClient & newClient, PlayerColor color, std::shared_ptr<CGameInterface> standIn)
++{
++	auto seat = std::make_shared<Seat>();
++	seat->color = color;
++	seat->name = newClient.gameState().getStartInfo()->playerInfos.at(color).name;
++	seat->cb = std::make_shared<CCallback>(newClient.gameStatePtr(), color, &newClient);
++	seat->cb->waitTillRealize = true;
++	seat->standIn = standIn;
++	seat->timeout = readConfig().timeout;
++
++	bool start = false;
++	{
++		std::lock_guard lock(mx);
++		if(client != &newClient)
++		{
++			seats.clear();
++			pendingQueries.clear();
++		}
++		client = &newClient;
++		seats[color] = seat;
++		start = !worker.joinable();
++		if(start)
++		{
++			boost::system::error_code ec;
++			const auto inbox = playerDir() / "inbox.jsonl";
++			inboxOffset = boost::filesystem::exists(inbox, ec) ? boost::filesystem::file_size(inbox, ec) : 0;
++		}
++	}
++	logGlobal->info("Claude player: %s (%s) is played by Claude, the stand-in AI takes over when Claude is silent", color.toString(), seat->name);
++	if(start)
++	{
++		stopping = false;
++		worker = std::thread([this]() { run(); });
++	}
++	writeState();
++}
++
++void ClaudePlayer::detach()
++{
++	stopping = true;
++	if(worker.joinable())
++		worker.join();
++	bool hadSeats = false;
++	{
++		std::lock_guard lock(mx);
++		hadSeats = !seats.empty();
++		seats.clear();
++		pendingQueries.clear();
++		client = nullptr;
++		stopping = false;
++	}
++	if(hadSeats)
++		writeState(); // no seats: the game is over, nobody waits for Claude
++}
++
++bool ClaudePlayer::controls(PlayerColor color) const
++{
++	std::lock_guard lock(mx);
++	return seats.count(color);
++}
++
++bool ClaudePlayer::onYourTurn(PlayerColor color, QueryID queryID)
++{
++	std::lock_guard lock(mx);
++	auto it = seats.find(color);
++	if(it == seats.end())
++		return false;
++	it->second->turnGiven = true;
++	it->second->turnQuery = queryID;
++	return true;
++}
++
++void ClaudePlayer::onPack(const CPack & pack)
++{
++	std::lock_guard lock(mx);
++	if(seats.empty())
++		return;
++
++	auto tell = [this](PlayerColor color, const std::string & text)
++	{
++		auto it = seats.find(color);
++		if(it == seats.end() || text.empty())
++			return;
++		auto & seat = *it->second;
++		(seat.commandRunning ? seat.commandEvents : seat.events).push_back(text);
++	};
++
++	if(const auto * query = dynamic_cast<const Query *>(&pack))
++	{
++		if(query->queryID.getNum() >= 0 && !dynamic_cast<const PlayerStartsTurn *>(&pack))
++			pendingQueries.insert(query->queryID);
++	}
++
++	if(const auto * p = dynamic_cast<const PlayerEndsTurn *>(&pack))
++	{
++		auto it = seats.find(p->player);
++		if(it != seats.end())
++			it->second->turnEnded = true;
++	}
++	else if(const auto * p = dynamic_cast<const InfoWindow *>(&pack))
++		tell(p->player, "消息：" + oneLine(p->text.toString()));
++	else if(const auto * p = dynamic_cast<const BlockingDialog *>(&pack))
++		tell(p->player, "询问（电脑替你回答了）：" + oneLine(p->text.toString()));
++	else if(const auto * p = dynamic_cast<const HeroLevelUp *>(&pack))
++	{
++		const auto * hero = client ? client->gameInfo().getHero(p->heroId) : nullptr;
++		tell(p->player, (hero ? hero->getNameTranslated() : std::string("英雄")) + " 升级了（技能由电脑替你选）");
++	}
++	else if(const auto * p = dynamic_cast<const SystemMessage *>(&pack))
++	{
++		for(auto & [color, seat] : seats)
++			if(seat->commandRunning)
++				seat->commandEvents.push_back("服务器：" + oneLine(p->text.toString()));
++	}
++	else if(const auto * p = dynamic_cast<const BattleResult *>(&pack))
++	{
++		const BattleInfo * battle = client ? client->gameState().getBattle(p->battleID) : nullptr;
++		if(!battle)
++			return;
++		for(auto side : {BattleSide::ATTACKER, BattleSide::DEFENDER})
++		{
++			const PlayerColor color = battle->getSide(side).color;
++			if(!seats.count(color))
++				continue;
++			const auto enemySide = side == BattleSide::ATTACKER ? BattleSide::DEFENDER : BattleSide::ATTACKER;
++			const auto * hero = battle->getSide(side).getHero();
++			const auto * enemyHero = battle->getSide(enemySide).getHero();
++			const auto * enemyArmy = battle->getSide(enemySide).getArmy();
++			std::string text = std::string("战斗：") + (hero ? hero->getNameTranslated() : std::string("你的部队")) + " 对 "
++				+ (enemyHero ? enemyHero->getNameTranslated() : (enemyArmy ? enemyArmy->getObjectName() : std::string("敌人")))
++				+ (p->winner == side ? "，赢了" : p->winner == enemySide ? "，输了" : "，平局");
++			if(p->result == EBattleResult::ESCAPE)
++				text += "（有一方逃跑）";
++			else if(p->result == EBattleResult::SURRENDER)
++				text += "（有一方投降）";
++			auto losses = [](const std::map<CreatureID, si32> & casualties)
++			{
++				std::string out;
++				for(const auto & [id, count] : casualties)
++					out += (out.empty() ? "" : "，") + id.toCreature()->getNamePluralTranslated() + "×" + std::to_string(count);
++				return out.empty() ? std::string("无") : out;
++			};
++			text += "；我方损失：" + losses(p->casualties[side]) + "；对方损失：" + losses(p->casualties[enemySide]);
++			tell(color, text);
++		}
++	}
++}
++
++void ClaudePlayer::onRequest(const CPackForServer & request, PlayerColor player)
++{
++	if(const auto * reply = dynamic_cast<const QueryReply *>(&request))
++	{
++		std::lock_guard lock(mx);
++		pendingQueries.erase(reply->qid);
++	}
++}
++
++std::shared_ptr<ClaudePlayer::Seat> ClaudePlayer::seatFor(const std::string & colorName)
++{
++	std::lock_guard lock(mx);
++	if(seats.empty())
++		return nullptr;
++	if(colorName.empty())
++		return seats.begin()->second;
++	for(auto & [color, seat] : seats)
++		if(boost::algorithm::iequals(color.toString(), colorName) || colorName == ::colorName(color))
++			return seat;
++	return nullptr;
++}
++
++void ClaudePlayer::run()
++{
++	setThreadName("claudePlayer");
++	while(!stopping)
++	{
++		try
++		{
++			std::vector<std::shared_ptr<Seat>> list;
++			{
++				std::lock_guard lock(mx);
++				for(auto & [color, seat] : seats)
++					list.push_back(seat);
++			}
++			for(auto & seat : list)
++			{
++				bool given;
++				bool ended;
++				QueryID query;
++				{
++					std::lock_guard lock(mx);
++					ended = seat->turnEnded;
++					seat->turnEnded = false;
++					given = seat->turnGiven;
++					seat->turnGiven = false;
++					query = seat->turnQuery;
++				}
++				if(ended)
++					finishTurn(*seat);
++				if(given)
++				{
++					seat->turnQuery = query;
++					startTurn(*seat);
++				}
++			}
++
++			pollInbox();
++
++			for(auto & seat : list)
++			{
++				if(seat->myTurn && !seat->handedOver && Clock::now() - seat->lastActivity > std::chrono::seconds(seat->timeout))
++					handOver(*seat, std::to_string(seat->timeout) + " 秒没有收到命令");
++			}
++		}
++		catch(const TerminationRequestedException &)
++		{
++			break;
++		}
++		catch(const std::exception & e)
++		{
++			logGlobal->error("Claude player: %s", e.what());
++		}
++
++		for(int i = 0; i < 4 && !stopping; ++i)
++			std::this_thread::sleep_for(std::chrono::milliseconds(50));
++	}
++}
++
++namespace
++{
++void post(const Seat & seat, const std::string & kind, const std::string & text, const std::string & id = {}, std::optional<bool> ok = std::nullopt)
++{
++	std::string line = "{\"ts\": " + jsonString(timestamp()) + ", \"kind\": " + jsonString(kind) + ", \"color\": " + jsonString(seat.color.toString())
++		+ ", \"day\": " + std::to_string(seat.cb->getDate(Date::DAY));
++	if(!id.empty())
++		line += ", \"id\": " + jsonString(id);
++	if(ok)
++		line += std::string(", \"ok\": ") + (*ok ? "true" : "false");
++	line += ", \"text\": " + jsonString(text) + "}";
++	appendLine(playerDir() / "outbox.jsonl", line);
++}
++
++std::string commandHelp()
++{
++	return "命令：move H1 x y [z]（走路，寻路交给游戏） · build T1 <建筑> · recruit T1 <兵种> [数量|max] · hire T1 [1|2] · end（结束回合）"
++		" · say <话>（不占回合） · brief · actions（带编号的可做事项，之后可以直接发编号） · status";
++}
++
++std::string briefing(const CGameState & gs, const Seat & seat, const std::vector<std::string> & changes, bool turnStart)
++{
++	const auto & cb = *seat.cb;
++	std::ostringstream out;
++	out << "# " << colorName(seat.color) << "（" << seat.name << "）· " << dateText(cb) << "\n";
++	if(turnStart)
++		out << "轮到你了。" << seat.timeout << " 秒内不发命令（每条命令重新计时），这回合剩下的就交给电脑打完。\n";
++	out << "地图：" << gs.getMap().name.toString() << "\n";
++	std::string swaps;
++	for(int i = 0; i < 8; ++i)
++		if(graphics && graphics->shownColor(PlayerColor(i)) != PlayerColor(i))
++			swaps += (swaps.empty() ? "" : "、") + std::string(colorNames[i]) + "显示成" + colorNames[graphics->shownColor(PlayerColor(i)).getNum()];
++	if(!swaps.empty())
++		out << "注意：玩家的屏幕上颜色换过（只是显示）：" << swaps << "。游戏自己的文字（比如「……玩家占有」）用的是显示出来的颜色名；"
++			<< "这份简报里写「红」「蓝」的地方是地图上真正的颜色。跟玩家说话时，按玩家看到的颜色说。\n";
++
++	if(turnStart)
++	{
++		out << "\n## 上回合以来\n";
++		if(changes.empty())
++			out << "- " << (seat.lastTurnEnd ? "没什么变化" : "这是你接手后的第一回合") << "\n";
++		for(const auto & line : changes)
++			out << "- " << line << "\n";
++	}
++
++	const auto res = cb.getResourceAmount();
++	out << "\n## 资源\n";
++	bool first = true;
++	for(int r : resourceOrder)
++	{
++		out << (first ? "" : " · ") << resourceName(r) << " " << res[r];
++		first = false;
++	}
++	out << "\n";
++
++	const auto heroes = cb.getHeroesInfo();
++	out << "\n## 英雄\n";
++	if(heroes.empty())
++		out << "（没有英雄）\n";
++	for(size_t i = 0; i < heroes.size(); ++i)
++		out << heroLine(heroes[i], static_cast<int>(i + 1)) << "\n";
++
++	const auto towns = cb.getTownsInfo();
++	out << "\n## 城镇\n";
++	if(towns.empty())
++		out << "（没有城镇）\n";
++	for(size_t i = 0; i < towns.size(); ++i)
++	{
++		const auto * t = towns[i];
++		out << "T" << (i + 1) << " " << t->getNameTranslated() << "（" << t->getFactionID().toEntity(LIBRARY)->getNameTranslated() << "）在 " << pos(t->visitablePos()) << "\n";
++		out << "   驻军：" << armyText(*t);
++		if(t->getGarrisonHero())
++			out << "（驻守英雄 " << t->getGarrisonHero()->getNameTranslated() << "）";
++		if(t->getVisitingHero())
++			out << "；来访英雄：" << t->getVisitingHero()->getNameTranslated();
++		out << "\n";
++		std::string built;
++		for(const auto & b : t->getBuildings())
++			if(!buildingName(t, b).empty())
++				built += (built.empty() ? "" : "、") + buildingName(t, b);
++		out << "   已建：" << built << "\n";
++		const auto canBuild = buildableNow(cb, t, true);
++		if(t->built >= cb.getSettings().getInteger(EGameSettings::TOWNS_BUILDINGS_PER_TURN_CAP))
++			out << "   今天已经建过了\n";
++		else if(!canBuild.empty())
++		{
++			std::string list;
++			for(const auto & b : canBuild)
++			{
++				const auto & cost = t->getTown()->buildings.at(b)->resources;
++				list += (list.empty() ? "" : "；") + buildingName(t, b) + "[" + buildingKey(t, b) + "] " + costText(cost)
++					+ (cb.canBuildStructure(t, b) == EBuildingState::NO_RESOURCES ? "（缺 " + missingText(cost, res) + "）" : "");
++			}
++			out << "   今天能建：" << list << "\n";
++		}
++		std::string recruits;
++		for(const auto & option : recruitOptions(t))
++		{
++			if(option.available <= 0)
++				continue;
++			const auto * c = option.creature.toCreature();
++			recruits += (recruits.empty() ? "" : "；") + c->getNamePluralTranslated() + "[" + shortKey(c->getJsonKey()) + "] " + std::to_string(option.available) + " 只，每只 " + costText(c->getFullRecruitCost());
++		}
++		if(!recruits.empty())
++			out << "   能招：" << recruits << "\n";
++		if(t->hasBuilt(BuildingID::TAVERN))
++		{
++			std::string tavern;
++			int n = 0;
++			for(const auto * h : cb.getAvailableHeroes(t))
++				tavern += (tavern.empty() ? "" : "；") + std::to_string(++n) + ". " + h->getNameTranslated() + "（" + h->getHeroClass()->getNameTranslated() + "）";
++			if(!tavern.empty())
++				out << "   酒馆（" << GameConstants::HERO_GOLD_COST << " 金）：" << tavern << "\n";
++		}
++	}
++
++	const auto snapshot = takeSnapshot(gs, seat);
++	out << "\n## 看得见的别家\n";
++	if(snapshot.others.empty())
++		out << "（没看到）\n";
++	int shown = 0;
++	for(const auto & [id, text] : snapshot.others)
++	{
++		if(++shown > 12)
++		{
++			out << "- ……还有 " << snapshot.others.size() - 12 << " 个\n";
++			break;
++		}
++		out << "- " << text << "\n";
++	}
++
++	out << "\n## 附近能去的（目的地坐标；本回合 = 今天走得到）\n";
++	for(size_t i = 0; i < heroes.size(); ++i)
++	{
++		const auto * h = heroes[i];
++		if(h->isGarrisoned())
++			continue;
++		const auto list = destinations(seat, h, 1);
++		out << "H" << (i + 1) << " " << h->getNameTranslated() << "：\n";
++		int today = 0;
++		int tomorrow = 0;
++		for(const auto & d : list)
++		{
++			if(d.turns == 0 && today++ < 10)
++				out << "   本回合 " << destinationText(d, h) << "（到了剩 " << d.moveRemains << " 行动力）\n";
++			else if(d.turns == 1 && tomorrow++ < 6)
++				out << "   明天 " << destinationText(d, h) << "\n";
++		}
++		if(list.empty())
++			out << "   （两天内走不到什么）\n";
++	}
++
++	out << "\n" << commandHelp() << "\n";
++	return out.str();
++}
++
++std::string actionsText(const CGameState & gs, Seat & seat)
++{
++	const auto & cb = *seat.cb;
++	const auto res = cb.getResourceAmount();
++	std::vector<std::pair<std::string, std::string>> items; // command, description
++
++	items.emplace_back("end", "结束回合");
++	const auto heroes = cb.getHeroesInfo();
++	for(size_t i = 0; i < heroes.size(); ++i)
++	{
++		const auto * h = heroes[i];
++		if(h->isGarrisoned() || h->movementPointsRemaining() == 0)
++			continue;
++		int n = 0;
++		for(const auto & d : destinations(seat, h, 0))
++		{
++			if(n++ >= 8)
++				break;
++			const int3 p = d.object->visitablePos();
++			items.emplace_back("move H" + std::to_string(i + 1) + " " + std::to_string(p.x) + " " + std::to_string(p.y) + " " + std::to_string(p.z),
++				h->getNameTranslated() + " 去 " + oneLine(d.object->getHoverText(h)) + "，到了剩 " + std::to_string(d.moveRemains) + " 行动力");
++		}
++	}
++	const auto towns = cb.getTownsInfo();
++	for(size_t i = 0; i < towns.size(); ++i)
++	{
++		const auto * t = towns[i];
++		const std::string T = "T" + std::to_string(i + 1);
++		for(const auto & b : buildableNow(cb, t, false))
++			items.emplace_back("build " + T + " " + buildingKey(t, b), t->getNameTranslated() + " 建 " + buildingName(t, b) + "：" + costText(t->getTown()->buildings.at(b)->resources));
++		for(const auto & option : recruitOptions(t))
++		{
++			if(option.available <= 0)
++				continue;
++			const auto * c = option.creature.toCreature();
++			const int canPay = affordable(c->getFullRecruitCost(), res);
++			if(canPay <= 0)
++				continue;
++			items.emplace_back("recruit " + T + " " + shortKey(c->getJsonKey()) + " max",
++				t->getNameTranslated() + " 招 " + c->getNamePluralTranslated() + "：有 " + std::to_string(option.available) + " 只，每只 " + costText(c->getFullRecruitCost())
++				+ "，现在最多买 " + std::to_string(std::min(canPay, option.available)) + " 只");
++		}
++		if(t->hasBuilt(BuildingID::TAVERN) && !t->getVisitingHero() && res[GameResID::GOLD] >= GameConstants::HERO_GOLD_COST)
++		{
++			int n = 0;
++			for(const auto * h : cb.getAvailableHeroes(t))
++			{
++				++n;
++				items.emplace_back("hire " + T + " " + std::to_string(n), t->getNameTranslated() + " 的酒馆招 " + h->getNameTranslated() + "（" + h->getHeroClass()->getNameTranslated() + "）：" + std::to_string(GameConstants::HERO_GOLD_COST) + " 金");
++			}
++		}
++	}
++
++	seat.actionList.clear();
++	std::ostringstream out;
++	out << "现在能做的事（直接发编号也行，比如 \"3\"；局面一变编号就要重新列）：\n";
++	for(size_t i = 0; i < items.size(); ++i)
++	{
++		seat.actionList.push_back(items[i].first);
++		out << "[" << (i + 1) << "] " << items[i].first << " — " << items[i].second << "\n";
++	}
++	return out.str();
++}
++
++const CGHeroInstance * findHero(const Seat & seat, const std::string & key)
++{
++	const auto heroes = seat.cb->getHeroesInfo();
++	std::string k = key;
++	if(k.size() > 1 && (k[0] == 'H' || k[0] == 'h') && isNumber(k.substr(1)))
++		k = k.substr(1);
++	if(isNumber(k))
++	{
++		const size_t index = std::stoul(k);
++		if(index >= 1 && index <= heroes.size())
++			return heroes[index - 1];
++	}
++	for(const auto * h : heroes)
++		if(h->getNameTranslated() == key)
++			return h;
++	std::string names;
++	for(size_t i = 0; i < heroes.size(); ++i)
++		names += (names.empty() ? "" : "，") + std::string("H") + std::to_string(i + 1) + " " + heroes[i]->getNameTranslated();
++	throw Refused("没有这个英雄：" + key + "（你的英雄：" + (names.empty() ? std::string("没有") : names) + "）");
++}
++
++const CGTownInstance * findTown(const Seat & seat, const std::string & key)
++{
++	const auto towns = seat.cb->getTownsInfo();
++	std::string k = key;
++	if(k.size() > 1 && (k[0] == 'T' || k[0] == 't') && isNumber(k.substr(1)))
++		k = k.substr(1);
++	if(isNumber(k))
++	{
++		const size_t index = std::stoul(k);
++		if(index >= 1 && index <= towns.size())
++			return towns[index - 1];
++	}
++	for(const auto * t : towns)
++		if(t->getNameTranslated() == key)
++			return t;
++	std::string names;
++	for(size_t i = 0; i < towns.size(); ++i)
++		names += (names.empty() ? "" : "，") + std::string("T") + std::to_string(i + 1) + " " + towns[i]->getNameTranslated();
++	throw Refused("没有这座城：" + key + "（你的城：" + (names.empty() ? std::string("没有") : names) + "）");
++}
++
++BuildingID findBuilding(const CGTownInstance * town, const std::string & key)
++{
++	const auto & buildings = town->getTown()->buildings;
++	if(isNumber(key) && buildings.count(BuildingID(std::stoi(key))))
++		return BuildingID(std::stoi(key));
++	std::vector<BuildingID> partial;
++	for(const auto & [id, building] : buildings)
++	{
++		if(boost::algorithm::iequals(shortKey(building->getJsonKey()), key) || boost::algorithm::iequals(building->getJsonKey(), key) || building->getNameTranslated() == key)
++			return id;
++		if(building->getNameTranslated().find(key) != std::string::npos)
++			partial.push_back(id);
++	}
++	if(partial.size() == 1)
++		return partial.front();
++	throw Refused(town->getNameTranslated() + " 没有叫 " + key + " 的建筑" + (partial.size() > 1 ? "（名字对上好几个，写全一点）" : "（brief 里方括号里是建筑代号）"));
++}
++}
++
++void ClaudePlayer::startTurn(Seat & seat)
++{
++	{
++		std::shared_lock gsLock(CGameState::mutex);
++		if(seat.turnQuery.getNum() >= 0)
++			seat.cb->selectionMade(0, seat.turnQuery); // accept the turn, as CPlayerInterface does
++	}
++	{
++		std::lock_guard lock(mx);
++		pendingQueries.clear();
++	}
++	const Config config = readConfig();
++	seat.myTurn = true;
++	seat.handedOver = false;
++	seat.actionList.clear();
++	seat.timeout = listenerAlive(config) ? config.timeout : std::min(config.timeout, config.idleTimeout);
++
++	std::string text;
++	{
++		std::shared_lock gsLock(CGameState::mutex);
++		const auto & gs = client->gameState();
++		Snapshot now = takeSnapshot(gs, seat);
++		std::vector<std::string> changes;
++		if(seat.lastTurnEnd)
++			changes = diffSnapshots(gs, seat, *seat.lastTurnEnd, now);
++		{
++			std::lock_guard lock(mx);
++			changes.insert(changes.end(), seat.events.begin(), seat.events.end());
++			seat.events.clear();
++		}
++		text = briefing(gs, seat, changes, true);
++		seat.turnStart = now;
++	}
++	writeAtomic(playerDir() / "briefing.md", text);
++	post(seat, "turn", text);
++	seat.lastActivity = Clock::now();
++	logGlobal->info("Claude player: turn of %s, day %d, %d s to answer", seat.color.toString(), seat.cb->getDate(Date::DAY), seat.timeout);
++	writeState();
++}
++
++void ClaudePlayer::finishTurn(Seat & seat)
++{
++	if(!seat.myTurn)
++		return;
++	seat.myTurn = false;
++	std::string text;
++	{
++		std::shared_lock gsLock(CGameState::mutex);
++		const auto & gs = client->gameState();
++		Snapshot end = takeSnapshot(gs, seat);
++		text = colorName(seat.color) + "（" + seat.name + "）第 " + std::to_string(end.day) + " 天的回合结束了" + (seat.handedOver ? "（后半段是电脑替你打的）" : "") + "。这回合：\n";
++		std::vector<std::string> changes;
++		if(seat.turnStart)
++			changes = diffSnapshots(gs, seat, *seat.turnStart, end);
++		if(changes.empty())
++			text += "- 什么都没变\n";
++		for(const auto & line : changes)
++			text += "- " + line + "\n";
++		seat.lastTurnEnd = end;
++	}
++	{
++		std::lock_guard lock(mx);
++		seat.events.clear(); // things that happened during our own turn were reported with the commands
++	}
++	post(seat, "turn-end", text);
++	writeState();
++	turnSummary = text;
++}
++
++void ClaudePlayer::handOver(Seat & seat, const std::string & reason)
++{
++	seat.handedOver = true;
++	const std::string text = reason + "，这回合剩下的交给电脑打完。";
++	logGlobal->info("Claude player: %s: %s", seat.color.toString(), text);
++	post(seat, "handover", text);
++	writeState();
++	seat.standIn->yourTurn(QueryID(-1)); // QueryID -1: the turn was already accepted
++}
++
++void ClaudePlayer::pollInbox()
++{
++	const auto inbox = playerDir() / "inbox.jsonl";
++	boost::system::error_code ec;
++	if(!boost::filesystem::exists(inbox, ec))
++		return;
++	const uintmax_t size = boost::filesystem::file_size(inbox, ec);
++	if(ec)
++		return;
++	if(size < inboxOffset)
++		inboxOffset = 0; // truncated or replaced
++	if(size == inboxOffset)
++		return;
++	std::ifstream in(inbox.c_str(), std::ios::binary);
++	in.seekg(static_cast<std::streamoff>(inboxOffset));
++	std::string chunk(static_cast<size_t>(size - inboxOffset), '\0');
++	in.read(chunk.data(), chunk.size());
++	chunk.resize(static_cast<size_t>(in.gcount()));
++	const size_t complete = chunk.rfind('\n'); // a half-written last line waits for the next round
++	if(complete == std::string::npos)
++		return;
++	inboxOffset += complete + 1;
++	std::istringstream stream(chunk.substr(0, complete));
++	for(std::string line; std::getline(stream, line);)
++	{
++		boost::algorithm::trim(line);
++		if(!line.empty())
++			handleRequest(line);
++	}
++}
++
++void ClaudePlayer::handleRequest(const std::string & line)
++{
++	std::string id;
++	std::string color;
++	std::vector<std::string> commands;
++	try
++	{
++		const JsonNode request(line.data(), line.size(), "claude-bridge/player/inbox.jsonl");
++		id = request["id"].isString() ? request["id"].String() : "";
++		color = request["color"].isString() ? request["color"].String() : "";
++		if(request["cmd"].isString())
++			commands.push_back(request["cmd"].String());
++		for(const auto & item : request["lines"].Vector())
++			if(item.isString())
++				commands.push_back(item.String());
++	}
++	catch(const std::exception & e)
++	{
++		logGlobal->error("Claude player: bad inbox line %s: %s", line, e.what());
++		return;
++	}
++
++	auto seat = seatFor(color);
++	if(!seat)
++	{
++		appendLine(playerDir() / "outbox.jsonl", "{\"ts\": " + jsonString(timestamp()) + ", \"kind\": \"reply\", \"id\": " + jsonString(id)
++			+ ", \"ok\": false, \"text\": " + jsonString("这局游戏里没有 Claude 的座位" + (color.empty() ? std::string() : "（颜色 " + color + "）")) + "}");
++		return;
++	}
++	seat->lastActivity = Clock::now();
++	if(seat->myTurn && !seat->handedOver)
++		seat->timeout = std::max(seat->timeout, readConfig().timeout); // someone answers after all: full time
++
++	std::string out;
++	bool allOk = true;
++	bool turnOver = false;
++	for(const auto & command : commands)
++	{
++		if(!allOk || turnOver)
++		{
++			out += "· 没执行：" + command + (turnOver ? "（回合已经结束）" : "（前面的命令没成功）") + "\n";
++			continue;
++		}
++		bool ok = true;
++		std::string result;
++		{
++			std::lock_guard lock(mx);
++			seat->commandRunning = true;
++			seat->commandEvents.clear();
++		}
++		try
++		{
++			result = execute(*seat, command, ok, turnOver);
++		}
++		catch(const Refused & e)
++		{
++			ok = false;
++			result = std::string("不行：") + e.what();
++		}
++		std::vector<std::string> events;
++		{
++			std::lock_guard lock(mx);
++			seat->commandRunning = false;
++			std::swap(events, seat->commandEvents);
++		}
++		out += "> " + command + "\n" + result + "\n";
++		for(const auto & event : events)
++			out += "  · " + event + "\n";
++		allOk = allOk && ok;
++	}
++	if(commands.empty())
++	{
++		out = "没收到命令。" + commandHelp();
++		allOk = false;
++	}
++	seat->lastActivity = Clock::now();
++	post(*seat, "reply", out, id, allOk);
++	writeState();
++}
++
++bool ClaudePlayer::waitQuiet(Seat & seat, std::shared_lock<std::shared_mutex> & gsLock)
++{
++	gsLock.unlock();
++	const auto start = Clock::now();
++	int quiet = 0;
++	bool ok = true;
++	for(;;)
++	{
++		if(stopping)
++		{
++			gsLock.lock();
++			throw TerminationRequestedException();
++		}
++		bool battle;
++		{
++			std::shared_lock lock(CGameState::mutex);
++			battle = client->gameState().getBattle(seat.color) != nullptr;
++		}
++		bool queries;
++		{
++			std::lock_guard lock(mx);
++			queries = !pendingQueries.empty();
++		}
++		if(!battle && !queries)
++		{
++			if(++quiet >= 3)
++				break;
++		}
++		else
++			quiet = 0;
++		if(!battle && Clock::now() - start > std::chrono::seconds(30))
++		{
++			ok = false; // a dialog nobody answers; go on anyway
++			std::lock_guard lock(mx);
++			pendingQueries.clear();
++			break;
++		}
++		std::this_thread::sleep_for(std::chrono::milliseconds(50));
++	}
++	gsLock.lock();
++	return ok;
++}
++
++std::string ClaudePlayer::execute(Seat & seat, const std::string & command, bool & ok, bool & turnOver)
++{
++	const auto words = splitWords(command);
++	if(words.empty())
++		throw Refused("空命令");
++	const std::string verb = lower(words[0]);
++
++	if(isNumber(verb) || (verb == "do" && words.size() == 2 && isNumber(words[1])))
++	{
++		const size_t index = std::stoul(isNumber(verb) ? verb : words[1]);
++		if(index < 1 || index > seat.actionList.size())
++			throw Refused("没有第 " + std::to_string(index) + " 项（先发 actions 列一下）");
++		const std::string actual = seat.actionList[index - 1];
++		return "（第 " + std::to_string(index) + " 项：" + actual + "）\n" + execute(seat, actual, ok, turnOver);
++	}
++
++	if(verb == "help")
++		return commandHelp();
++
++	if(verb == "status")
++	{
++		std::shared_lock gsLock(CGameState::mutex);
++		const auto & gs = client->gameState();
++		std::string acting;
++		for(const auto & color : gs.actingPlayers)
++			acting += (acting.empty() ? "" : "、") + playerLabel(gs, color);
++		std::string text = dateText(*seat.cb) + "，现在行动的是：" + (acting.empty() ? std::string("没人") : acting) + "。";
++		if(seat.myTurn && !seat.handedOver)
++		{
++			const auto left = seat.timeout - std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - seat.lastActivity).count();
++			text += "轮到你了，还剩 " + std::to_string(std::max<long long>(0, left)) + " 秒（每条命令都会重新计时）。";
++		}
++		else if(seat.myTurn)
++			text += "这回合已经交给电脑了。";
++		else
++			text += "还没轮到你。";
++		return text;
++	}
++
++	if(verb == "brief" || verb == "briefing")
++	{
++		std::shared_lock gsLock(CGameState::mutex);
++		return briefing(client->gameState(), seat, {}, false);
++	}
++
++	if(verb == "actions")
++	{
++		std::shared_lock gsLock(CGameState::mutex);
++		if(!seat.myTurn || seat.handedOver)
++			throw Refused("现在不是你的回合");
++		return actionsText(client->gameState(), seat);
++	}
++
++	if(verb == "say")
++	{
++		const std::string text = command.substr(command.find(words[0]) + words[0].size());
++		std::string trimmed = boost::algorithm::trim_copy(text);
++		if(trimmed.empty())
++			throw Refused("say 后面要跟要说的话");
++		const std::string from = seat.name;
++		ENGINE->dispatchMainThread([from, trimmed]()
++		{
++			if(GAME->server().client)
++				GAME->server().getGameChat().getClaudeBridge().showLine(from, trimmed);
++		});
++		return "已经说到游戏里了（" + from + "）：" + trimmed;
++	}
++
++	if(verb == "screenshot")
++	{
++		// tests only: it captures the whole game screen and announces the file in the game chat
++		if(!std::getenv("VCMI_CLAUDE_PLAYER_DEV"))
++			throw Refused("screenshot 只在测试客户端里能用（VCMI_CLAUDE_PLAYER_DEV）");
++		ENGINE->dispatchMainThread([]() { ENGINE->screenHandler().screenShot(); });
++		return "截图存到 " + (VCMIDirs::get().userExtractedPath() / "screenshots").string() + "（最新的那张）";
++	}
++
++	// everything below acts in the game
++	if(verb != "move" && verb != "build" && verb != "recruit" && verb != "hire" && verb != "end")
++		throw Refused("不认识的命令 " + words[0] + "。" + commandHelp());
++	if(!seat.myTurn)
++		throw Refused("现在不是你的回合");
++	if(seat.handedOver)
++		throw Refused("这回合已经交给电脑了，等下一回合");
++
++	std::shared_lock gsLock(CGameState::mutex);
++	auto & cb = *seat.cb;
++
++	if(verb == "end")
++	{
++		cb.endTurn();
++		gsLock.unlock();
++		const auto start = Clock::now();
++		bool ended = false;
++		while(!ended && Clock::now() - start < std::chrono::seconds(15))
++		{
++			{
++				std::lock_guard lock(mx);
++				ended = seat.turnEnded;
++				seat.turnEnded = false;
++			}
++			if(!ended)
++				std::this_thread::sleep_for(std::chrono::milliseconds(50));
++		}
++		gsLock.lock();
++		if(!ended)
++		{
++			ok = false;
++			return "服务器还没结束这回合（可能有对话框或战斗没完）";
++		}
++		gsLock.unlock();
++		finishTurn(seat);
++		gsLock.lock();
++		turnOver = true;
++		return turnSummary;
++	}
++
++	if(verb == "move")
++	{
++		if(words.size() < 4)
++			throw Refused("用法：move H1 x y [z]");
++		const auto * hero = findHero(seat, words[1]);
++		if(!isNumber(words[2]) || !isNumber(words[3]) || (words.size() > 4 && !isNumber(words[4])))
++			throw Refused("坐标要写数字：move H1 x y [z]");
++		const int3 dst(std::stoi(words[2]), std::stoi(words[3]), words.size() > 4 ? std::stoi(words[4]) : hero->visitablePos().z);
++		if(!cb.isInTheMap(dst))
++			throw Refused(pos(dst) + " 不在地图里");
++		if(hero->isGarrisoned())
++			throw Refused(hero->getNameTranslated() + " 在城里驻守，先换成来访英雄才能出门");
++		const ObjectInstanceID heroID = hero->id;
++		const int3 start = hero->visitablePos();
++		const std::string name = hero->getNameTranslated();
++
++		auto current = [&]() -> const CGHeroInstance *
++		{
++			const auto * h = cb.getHero(heroID);
++			return h && h->getOwner() == seat.color ? h : nullptr;
++		};
++
++		std::string note;
++		if(start == dst)
++		{
++			// visit the object we stand on again
++			cb.moveHero(hero, hero->convertFromVisitablePos(dst), false);
++			waitQuiet(seat, gsLock);
++			note = "原地又拜访了一次";
++		}
++		else
++		{
++			if(!cb.isVisible(dst))
++				throw Refused(pos(dst) + " 还在迷雾里，看不见的地方不能当目的地");
++			if(hero->movementPointsRemaining() == 0)
++				throw Refused(name + " 今天没有行动力了");
++			for(int step = 0; step < 300; ++step)
++			{
++				const auto * h = current();
++				if(!h)
++					break;
++				if(h->visitablePos() == dst)
++					break;
++				PathfinderCache cache(&cb, PathfinderOptions(cb));
++				auto paths = cache.getPathsInfo(h);
++				CGPath path;
++				if(!paths->getPath(path, dst) || path.nodes.size() < 2)
++				{
++					if(step == 0)
++						throw Refused(name + " 走不到 " + pos(dst) + "（被挡住了，或者要坐船、要先打开路）");
++					note = "后面的路走不通了";
++					break;
++				}
++				const auto & next = path.nextNode();
++				if(next.turns > 0)
++				{
++					if(step == 0)
++						throw Refused(name + " 今天的行动力不够走下一步，到 " + pos(dst) + " 还要 " + std::to_string(path.lastNode().turns) + " 天");
++					note = "今天的行动力用完了，到 " + pos(dst) + " 还要 " + std::to_string(path.lastNode().turns) + " 天";
++					break;
++				}
++				const int3 before = h->visitablePos();
++				if(next.isTeleportAction())
++					cb.moveHero(h, h->pos, false);
++				else
++					cb.moveHero(h, h->convertFromVisitablePos(next.coord), next.layer == EPathfindingLayer::AIR || next.layer == EPathfindingLayer::WATER);
++				const bool battleOrDialog = next.action == EPathNodeAction::BATTLE || next.action == EPathNodeAction::TELEPORT_BATTLE;
++				waitQuiet(seat, gsLock);
++				const auto * after = current();
++				if(!after)
++					break;
++				if(next.coord == dst && after->visitablePos() != dst)
++				{
++					// blocking objects (resources, chests, monsters, dwellings...) are visited from next door
++					note = battleOrDialog ? "和目的地上的守军打了一仗" : "在旁边一格拜访了目的地";
++					break;
++				}
++				if(after->visitablePos() == before && !next.isTeleportAction())
++				{
++					note = "走不动了，停在 " + pos(before);
++					break;
++				}
++				if(battleOrDialog && after->visitablePos() != dst)
++				{
++					note = "途中打了一仗，先停在这里";
++					break;
++				}
++			}
++		}
++		const auto * h = current();
++		if(!h)
++			return name + " 不在了（战死了或者被俘了）";
++		std::string text = name + " 从 " + pos(start) + " 到了 " + pos(h->visitablePos()) + "，剩 " + std::to_string(h->movementPointsRemaining()) + " 行动力";
++		if(h->visitablePos() == dst)
++			text += "，到达目的地";
++		if(!note.empty())
++			text += "；" + note;
++		text += "。兵：" + armyText(*h);
++		return text;
++	}
++
++	if(verb == "build")
++	{
++		if(words.size() < 3)
++			throw Refused("用法：build T1 <建筑>（brief 里方括号里是建筑代号）");
++		const auto * town = findTown(seat, words[1]);
++		const BuildingID building = findBuilding(town, joinFrom(words, 2));
++		const auto state = cb.canBuildStructure(town, building);
++		const std::string name = buildingName(town, building);
++		const auto & cost = town->getTown()->buildings.at(building)->resources;
++		if(state == EBuildingState::NO_RESOURCES)
++			throw Refused(name + " 要 " + costText(cost) + "，还差 " + missingText(cost, cb.getResourceAmount()));
++		if(state == EBuildingState::PREREQUIRES || state == EBuildingState::MISSING_BASE)
++		{
++			auto needed = town->genBuildingRequirements(building).getFulfillmentCandidates([town](const BuildingID & id) { return town->hasBuilt(id); });
++			std::string list;
++			for(const auto & id : needed)
++				if(!buildingName(town, id).empty())
++					list += (list.empty() ? "" : "、") + buildingName(town, id);
++			throw Refused(name + "：" + buildingStateText(state) + (list.empty() ? "" : "，要先建：" + list));
++		}
++		if(state != EBuildingState::ALLOWED)
++			throw Refused(name + "：" + buildingStateText(state));
++		const ObjectInstanceID townID = town->id;
++		cb.buildBuilding(town, building);
++		waitQuiet(seat, gsLock);
++		const auto * after = cb.getTown(townID);
++		if(!after || !after->hasBuilt(building))
++		{
++			ok = false;
++			return "服务器没同意建 " + name;
++		}
++		return after->getNameTranslated() + " 建好了 " + name + "，花了 " + costText(cost);
++	}
++
++	if(verb == "recruit")
++	{
++		if(words.size() < 3)
++			throw Refused("用法：recruit T1 <兵种> [数量|max]");
++		const auto * town = findTown(seat, words[1]);
++		std::string countWord = words.size() > 3 ? lower(words.back()) : "max";
++		const std::string creatureKey = words.size() > 3 ? joinFrom(std::vector<std::string>(words.begin(), words.end() - 1), 2) : words[2];
++		std::optional<RecruitOption> chosen;
++		std::string offered;
++		for(const auto & option : recruitOptions(town))
++		{
++			const auto * c = option.creature.toCreature();
++			offered += (offered.empty() ? "" : "、") + c->getNamePluralTranslated() + "[" + shortKey(c->getJsonKey()) + "]";
++			if(boost::algorithm::iequals(shortKey(c->getJsonKey()), creatureKey) || boost::algorithm::iequals(c->getJsonKey(), creatureKey)
++				|| c->getNamePluralTranslated() == creatureKey || c->getNameSingularTranslated() == creatureKey
++				|| (isNumber(creatureKey) && option.creature.getNum() == std::stoi(creatureKey)))
++				chosen = option;
++		}
++		if(!chosen)
++			throw Refused(town->getNameTranslated() + " 招不到 " + creatureKey + "（能招的：" + (offered.empty() ? std::string("没有") : offered) + "）");
++		const auto * c = chosen->creature.toCreature();
++		const auto cost = c->getFullRecruitCost();
++		const auto res = cb.getResourceAmount();
++		if(chosen->available <= 0)
++			throw Refused(c->getNamePluralTranslated() + " 这周已经招完了");
++		const int canPay = affordable(cost, res);
++		int amount;
++		if(countWord == "max" || countWord == "all")
++			amount = std::min(chosen->available, canPay);
++		else if(isNumber(countWord))
++			amount = std::stoi(countWord);
++		else
++			throw Refused("数量要写数字或 max");
++		std::string note;
++		if(amount > chosen->available)
++		{
++			note = "（只有 " + std::to_string(chosen->available) + " 只）";
++			amount = chosen->available;
++		}
++		if(amount <= 0)
++			throw Refused("钱不够：每只 " + costText(cost));
++		if(amount > canPay)
++			throw Refused(std::to_string(amount) + " 只要 " + costText(cost * amount) + "，钱不够，最多买 " + std::to_string(canPay) + " 只");
++
++		const CArmedInstance * dst = nullptr;
++		for(const CArmedInstance * candidate : {static_cast<const CArmedInstance *>(town->getVisitingHero()), static_cast<const CArmedInstance *>(town->getGarrisonHero())})
++			if(!dst && candidate && candidate->getSlotFor(c).validSlot())
++				dst = candidate;
++		if(!dst && !town->getGarrisonHero() && town->getSlotFor(c).validSlot())
++			dst = town;
++		if(!dst)
++			throw Refused("城里和英雄身上都没有空位放 " + c->getNamePluralTranslated() + "（七个格子都满了）");
++		const ObjectInstanceID dstID = dst->id;
++		const std::string dstName = dst == town ? town->getNameTranslated() + " 的驻军" : dynamic_cast<const CGHeroInstance *>(dst)->getNameTranslated();
++		const int before = creatureCount(*dst, chosen->creature);
++		cb.recruitCreatures(town, dst, chosen->creature, amount, chosen->level);
++		waitQuiet(seat, gsLock);
++		const auto * after = dynamic_cast<const CArmedInstance *>(cb.getObj(dstID, false));
++		const int got = after ? creatureCount(*after, chosen->creature) - before : 0;
++		if(got <= 0)
++		{
++			ok = false;
++			return "服务器没同意招兵";
++		}
++		return "招了 " + std::to_string(got) + " 只 " + c->getNamePluralTranslated() + note + "，进了 " + dstName + "，花了 " + costText(cost * got);
++	}
++
++	if(verb == "hire")
++	{
++		if(words.size() < 2)
++			throw Refused("用法：hire T1 [1|2|英雄名]");
++		const auto * town = findTown(seat, words[1]);
++		if(!town->hasBuilt(BuildingID::TAVERN))
++			throw Refused(town->getNameTranslated() + " 还没有酒馆");
++		if(town->getVisitingHero())
++			throw Refused(town->getNameTranslated() + " 门口有来访英雄 " + town->getVisitingHero()->getNameTranslated() + "，新英雄没地方站，先把他移开");
++		if(cb.getResourceAmount(GameResID::GOLD) < GameConstants::HERO_GOLD_COST)
++			throw Refused("招英雄要 " + std::to_string(GameConstants::HERO_GOLD_COST) + " 金币");
++		const auto available = cb.getAvailableHeroes(town);
++		if(available.empty())
++			throw Refused("酒馆里没有英雄");
++		const CGHeroInstance * chosen = nullptr;
++		const std::string key = words.size() > 2 ? joinFrom(words, 2) : "1";
++		if(isNumber(key) && std::stoul(key) >= 1 && std::stoul(key) <= available.size())
++			chosen = available[std::stoul(key) - 1];
++		for(const auto * h : available)
++			if(!chosen && h->getNameTranslated() == key)
++				chosen = h;
++		if(!chosen)
++			throw Refused("酒馆里没有 " + key);
++		const std::string name = chosen->getNameTranslated();
++		const size_t before = cb.getHeroesInfo().size();
++		cb.recruitHero(town, chosen);
++		waitQuiet(seat, gsLock);
++		const auto heroes = cb.getHeroesInfo();
++		if(heroes.size() <= before)
++		{
++			ok = false;
++			return "服务器没同意招 " + name;
++		}
++		for(size_t i = 0; i < heroes.size(); ++i)
++			if(heroes[i]->getNameTranslated() == name)
++				return "招到了 " + heroLine(heroes[i], static_cast<int>(i + 1));
++		return "招到了 " + name;
++	}
++
++	throw Refused("不认识的命令 " + words[0]);
++}
++
++void ClaudePlayer::writeState()
++{
++	std::vector<std::shared_ptr<Seat>> list;
++	{
++		std::lock_guard lock(mx);
++		for(auto & [color, seat] : seats)
++			list.push_back(seat);
++	}
++	std::string text = "{\n  \"updated\": " + jsonString(timestamp()) + ",\n  \"seats\": [";
++	bool first = true;
++	for(const auto & seat : list)
++	{
++		long long left = 0;
++		if(seat->myTurn && !seat->handedOver)
++			left = std::max<long long>(0, seat->timeout - std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - seat->lastActivity).count());
++		text += std::string(first ? "" : ",") + "\n    {\"color\": " + jsonString(seat->color.toString()) + ", \"name\": " + jsonString(seat->name)
++			+ ", \"turn\": " + (seat->myTurn ? "true" : "false") + ", \"handedOver\": " + (seat->handedOver ? "true" : "false")
++			+ ", \"day\": " + std::to_string(seat->cb->getDate(Date::DAY)) + ", \"timeout\": " + std::to_string(seat->timeout)
++			+ ", \"secondsLeft\": " + std::to_string(left) + "}";
++		first = false;
++	}
++	text += "\n  ]\n}\n";
++	writeAtomic(playerDir() / "state.json", text);
++}
+diff --git a/client/ClaudePlayer.h b/client/ClaudePlayer.h
+new file mode 100644
+index 0000000..5e752d2
+--- /dev/null
++++ b/client/ClaudePlayer.h
+@@ -0,0 +1,82 @@
++/*
++ * ClaudePlayer.h, H3 Mod local patch (not part of VCMI)
++ *
++ * License: GNU General Public License v2.0 or later
++ *
++ */
++#pragma once
++
++#include "../lib/constants/EntityIdentifiers.h"
++
++VCMI_LIB_NAMESPACE_BEGIN
++class CCallback;
++class CGameInterface;
++struct CPack;
++struct CPackForServer;
++struct PlayerSettings;
++VCMI_LIB_NAMESPACE_END
++
++class CClient;
++
++/// Claude as a local hotseat player.
++///
++/// A hotseat seat whose player name is "Claude" (or "回声") gets no CPlayerInterface. The client
++/// installs the usual adventure AI for it, which answers dialogs, fights battles (auto battle) and
++/// stands in when Claude is silent, but the AI does not get the turn: Claude does. Turns travel as
++/// files in <claude-bridge>/player/ (see ClaudePlayer.cpp):
++/// - briefing.md, outbox.jsonl: the turn briefing (what this colour can see, what changed since its
++///   last turn), replies to commands, the end-of-turn summary;
++/// - inbox.jsonl: commands from Claude (move, build, recruit, hire, end, say, ...), checked one by
++///   one and refused with a reason when they are not possible;
++/// - state.json: whose turn it is and how long Claude has left.
++/// If Claude sends nothing for a few minutes, the AI plays the rest of the turn.
++/// tools/vcmi_claude_player.py is the command line end of this.
++class ClaudePlayer : boost::noncopyable
++{
++public:
++	static ClaudePlayer & get();
++
++	/// Claude plays a hotseat seat named "Claude" (any case, also "Claude 2" etc.) or "回声"
++	static bool isClaudeName(const std::string & name);
++	/// a human seat that a person plays (not Claude); UI code uses this instead of isControlledByHuman()
++	static bool isPerson(const PlayerSettings & settings);
++
++	/// CClient::initPlayerInterfaces (network thread). `standIn` is the AI already installed for the colour
++	void attach(CClient & client, PlayerColor color, std::shared_ptr<CGameInterface> standIn);
++	/// CClient::finishGameplay: stop everything before the game state goes away
++	void detach();
++
++	bool controls(PlayerColor color) const;
++	/// network thread, PlayerStartsTurn. Returns false if the stand-in AI should get the turn as usual
++	bool onYourTurn(PlayerColor color, QueryID queryID);
++	/// network thread, after a pack was applied
++	void onPack(const CPack & pack);
++	/// any thread, CClient::sendRequest
++	void onRequest(const CPackForServer & request, PlayerColor player);
++
++	struct Seat;
++	struct Snapshot;
++	ClaudePlayer();
++	~ClaudePlayer();
++
++private:
++	mutable std::mutex mx;
++	CClient * client = nullptr;
++	std::map<PlayerColor, std::shared_ptr<Seat>> seats;
++	std::set<QueryID> pendingQueries; // asked by the server, not answered yet (any colour of this client)
++	std::thread worker;
++	std::atomic<bool> stopping = false;
++	uintmax_t inboxOffset = 0;
++	std::string turnSummary; // worker thread: text of the last finished turn
++
++	void run();
++	void startTurn(Seat & seat);
++	void finishTurn(Seat & seat);
++	void handOver(Seat & seat, const std::string & reason);
++	void pollInbox();
++	void handleRequest(const std::string & line);
++	std::string execute(Seat & seat, const std::string & command, bool & ok, bool & turnOver);
++	bool waitQuiet(Seat & seat, std::shared_lock<std::shared_mutex> & gsLock);
++	void writeState();
++	std::shared_ptr<Seat> seatFor(const std::string & colorName);
++};
+diff --git a/client/Client.cpp b/client/Client.cpp
+index adad66c..cdb5320 100644
+--- a/client/Client.cpp
++++ b/client/Client.cpp
+@@ -15,6 +15,7 @@
+ #include "PlayerLocalState.h"
+ #include "CServerHandler.h"
+ #include "ClientNetPackVisitors.h"
++#include "ClaudePlayer.h"
+ #include "adventureMap/AdventureMapInterface.h"
+ #include "battle/BattleInterface.h"
+ #include "GameEngine.h"
+@@ -170,6 +171,7 @@ void CClient::endNetwork()
+ void CClient::finishGameplay()
+ {
+ 	waitingRequest.requestTermination();
++	ClaudePlayer::get().detach();
+ 
+ 	//suggest interfaces to finish their stuff (AI should interrupt any bg working threads)
+ 	for(auto & i : playerint)
+@@ -245,7 +247,7 @@ void CClient::initPlayerEnvironments()
+ 	
+ 	if(settings["session"]["spectate"].Bool())
+ 	{
+-		playerEnvironments[PlayerColor::SPECTATOR] = std::make_shared<CPlayerEnvironment>(PlayerColor::SPECTATOR, this, std::make_shared<CCallback>(gamestate, std::nullopt, this));
++		playerEnvironments[PlayerColor::SPECTATOR] = std::make_shared<CPlayerEnvironment>(PlayerColor::SPECTATOR, this, std::make_shared<CCallback>(gamestate, findPlayerColorForSpectatorInterface(), this));
+ 	}
+ }
+ 
+@@ -270,6 +272,22 @@ void CClient::initPlayerInterfaces()
+ 				auto AiToGive = aiNameForPlayer(playerInfo.second, false, alliedToHuman);
+ 				logNetwork->info("Player %s will be lead by %s", color.toString(), AiToGive);
+ 				installNewPlayerInterface(CDynLibHandler::getNewAI(AiToGive), color);
++				if(ClaudePlayer::isClaudeName(playerInfo.second.name)) // H3 Mod: an AI seat given to Claude in the lobby
++					ClaudePlayer::get().attach(*this, color, playerint[color]);
++			}
++			else if(ClaudePlayer::isClaudeName(playerInfo.second.name))
++			{
++				// H3 Mod local patch: Claude plays this hotseat seat, see ClaudePlayer.h. The AI installed
++				// here answers dialogs and fights battles, and plays the turn when Claude is silent
++				bool alliedToHuman = false;
++				for(const auto & allyInfo : gameState().getStartInfo()->playerInfos)
++					if(allyInfo.first != color && gameState().getPlayerTeam(allyInfo.first) == gameState().getPlayerTeam(color) && ClaudePlayer::isPerson(allyInfo.second))
++						alliedToHuman = true;
++
++				auto standIn = CDynLibHandler::getNewAI(aiNameForPlayer(false, alliedToHuman));
++				logNetwork->info("Player %s will be lead by Claude", color.toString());
++				installNewPlayerInterface(standIn, color);
++				ClaudePlayer::get().attach(*this, color, standIn);
+ 			}
+ 			else
+ 			{
+@@ -288,7 +306,8 @@ void CClient::initPlayerInterfaces()
+ 
+ 	if(settings["session"]["spectate"].Bool())
+ 	{
+-		installNewPlayerInterface(std::make_shared<CPlayerInterface>(PlayerColor::SPECTATOR), PlayerColor::SPECTATOR, true);
++		const PlayerColor spectatorInterfacePlayer = findPlayerColorForSpectatorInterface().value_or(PlayerColor(0));
++		installNewPlayerInterface(std::make_shared<CPlayerInterface>(spectatorInterfacePlayer), PlayerColor::SPECTATOR, true);
+ 	}
+ 
+ 	if(GAME->server().getAllClientPlayers(GAME->server().logicConnection->connectionID).count(PlayerColor::NEUTRAL))
+@@ -324,12 +343,36 @@ std::string CClient::aiNameForPlayer(bool battleAI, bool alliedToHuman) const
+ 	return goodAI;
+ }
+ 
++// Backported from VCMI develop: the adventure UI is not fully spectator-aware and
++// still reads player-local state via CPlayerInterface::playerID, so the spectator
++// interface borrows the colour of a real player.
++std::optional<PlayerColor> CClient::findPlayerColorForSpectatorInterface() const
++{
++	for(const PlayerColor & color : gameState().actingPlayers)
++	{
++		if(color.isValidPlayer() && gameState().players.count(color))
++			return color;
++	}
++
++	for(const auto & playerState : gameState().players)
++	{
++		if(playerState.first.isValidPlayer())
++			return playerState.first;
++	}
++
++	return std::nullopt;
++}
++
+ void CClient::installNewPlayerInterface(std::shared_ptr<CGameInterface> gameInterface, PlayerColor color, bool battlecb)
+ {
+ 	playerint[color] = gameInterface;
+ 
+ 	logGlobal->trace("\tInitializing the interface for player %s", color.toString());
+-	auto cb = std::make_shared<CCallback>(gamestate, color, this);
++	std::optional<PlayerColor> callbackPlayer = color;
++	if(color == PlayerColor::SPECTATOR)
++		callbackPlayer = findPlayerColorForSpectatorInterface();
++
++	auto cb = std::make_shared<CCallback>(gamestate, callbackPlayer, this);
+ 	battleCallbacks[color] = cb;
+ 	gameInterface->initGameInterface(playerEnvironments.at(color), cb);
+ 
+@@ -362,6 +405,7 @@ void CClient::handlePack(CPackForClient & pack)
+ 	}
+ 	logNetwork->trace("\tApplied on gs: %s", typeid(pack).name());
+ 	pack.visit(afterVisitor);
++	ClaudePlayer::get().onPack(pack);
+ 	logNetwork->trace("\tMade second apply on cl: %s", typeid(pack).name());
+ }
+ 
+@@ -381,6 +425,7 @@ int CClient::sendRequest(const CPackForServer & request, PlayerColor player, boo
+ 	GAME->server().sendGamePack(request);
+ 	if(vstd::contains(playerint, player))
+ 		playerint[player]->requestSent(&request, requestID);
++	ClaudePlayer::get().onRequest(request, player);
+ 
+ 	if(waitTillRealize)
+ 	{
+diff --git a/client/Client.h b/client/Client.h
+index e77bd19..91bc21a 100644
+--- a/client/Client.h
++++ b/client/Client.h
+@@ -163,6 +163,7 @@ public:
+ 	std::string aiNameForPlayer(const PlayerSettings & ps, bool battleAI, bool alliedToHuman) const; //empty means no AI -> human
+ 	std::string aiNameForPlayer(bool battleAI, bool alliedToHuman) const;
+ 	void installNewPlayerInterface(std::shared_ptr<CGameInterface> gameInterface, PlayerColor color, bool battlecb = false);
++	std::optional<PlayerColor> findPlayerColorForSpectatorInterface() const;
+ 	void installNewBattleInterface(std::shared_ptr<CBattleGameInterface> battleInterface, PlayerColor color, bool needCallback = true);
+ 
+ 	//Set of metrhods that allows adding more interfaces for this player that'll receive game event call-ins.
+diff --git a/client/GameChatHandler.cpp b/client/GameChatHandler.cpp
+index efd9c88..21d1ef6 100644
+--- a/client/GameChatHandler.cpp
++++ b/client/GameChatHandler.cpp
+@@ -10,6 +10,7 @@
+ #include "StdInc.h"
+ 
+ #include "GameChatHandler.h"
++#include "ClaudeBridge.h"
+ #include "GameInstance.h"
+ #include "CServerHandler.h"
+ #include "CPlayerInterface.h"
+@@ -27,6 +28,18 @@
+ #include "../lib/texts/CGeneralTextHandler.h"
+ #include "../lib/texts/TextOperations.h"
+ 
++GameChatHandler::GameChatHandler()
++	: claudeBridge(std::make_unique<ClaudeBridge>())
++{
++}
++
++GameChatHandler::~GameChatHandler() = default;
++
++ClaudeBridge & GameChatHandler::getClaudeBridge()
++{
++	return *claudeBridge;
++}
++
+ const std::vector<GameChatMessage> & GameChatHandler::getChatHistory() const
+ {
+ 	return chatHistory;
+@@ -41,6 +54,7 @@ void GameChatHandler::sendMessageGameplay(const std::string & messageText)
+ {
+ 	GAME->interface()->cb->sendMessage(messageText, GAME->interface()->localState->getCurrentArmy());
+ 	GAME->server().getGlobalLobby().sendMatchChatMessage(messageText);
++	claudeBridge->onPlayerChat(messageText);
+ }
+ 
+ void GameChatHandler::sendMessageLobby(const std::string & senderName, const std::string & messageText)
+@@ -103,6 +117,7 @@ void GameChatHandler::onNewGameMessageReceived(PlayerColor sender, const std::st
+ void GameChatHandler::onNewSystemMessageReceived(const std::string & messageText)
+ {
+ 	chatHistory.push_back({"System", messageText, TextOperations::getCurrentFormattedTimeLocal()});
++	claudeBridge->onSystemMessage(messageText);
+ 
+ 	if(GAME->interface() && !settings["session"]["hideSystemMessages"].Bool())
+ 		GAME->interface()->cingconsole->addMessage(TextOperations::getCurrentFormattedTimeLocal(), "System", messageText);
+diff --git a/client/GameChatHandler.h b/client/GameChatHandler.h
+index 98d7098..294db83 100644
+--- a/client/GameChatHandler.h
++++ b/client/GameChatHandler.h
+@@ -11,6 +11,8 @@
+ 
+ #include "../lib/constants/EntityIdentifiers.h"
+ 
++class ClaudeBridge;
++
+ struct GameChatMessage
+ {
+ 	std::string senderName;
+@@ -23,7 +25,13 @@ struct GameChatMessage
+ class GameChatHandler : boost::noncopyable
+ {
+ 	std::vector<GameChatMessage> chatHistory;
++	std::unique_ptr<ClaudeBridge> claudeBridge; // H3 Mod local patch, see ClaudeBridge.h
+ public:
++	GameChatHandler();
++	~GameChatHandler();
++
++	ClaudeBridge & getClaudeBridge();
++
+ 	/// Returns all message history for current match
+ 	const std::vector<GameChatMessage> & getChatHistory() const;
+ 
+diff --git a/client/NetPacksClient.cpp b/client/NetPacksClient.cpp
+index 295572d..f585b64 100644
+--- a/client/NetPacksClient.cpp
++++ b/client/NetPacksClient.cpp
+@@ -11,6 +11,7 @@
+ #include "ClientNetPackVisitors.h"
+ 
+ #include "Client.h"
++#include "ClaudePlayer.h"
+ #include "CPlayerInterface.h"
+ #include "windows/GUIClasses.h"
+ #include "windows/CCastleInterface.h"
+@@ -926,7 +927,8 @@ void ApplyClientNetPackVisitor::visitPlayerStartsTurn(PlayerStartsTurn & pack)
+ 	logNetwork->debug("Server gives turn to %s", pack.player.toString());
+ 
+ 	callAllInterfaces(cl, &IGameEventsReceiver::playerStartsTurn, pack.player);
+-	callOnlyThatInterface(cl, pack.player, &CGameInterface::yourTurn, pack.queryID);
++	if(!ClaudePlayer::get().onYourTurn(pack.player, pack.queryID)) // H3 Mod: Claude takes the turn instead of the stand-in AI
++		callOnlyThatInterface(cl, pack.player, &CGameInterface::yourTurn, pack.queryID);
+ }
+ 
+ void ApplyClientNetPackVisitor::visitPlayerEndsTurn(PlayerEndsTurn & pack)
+diff --git a/client/adventureMap/AdventureMapInterface.cpp b/client/adventureMap/AdventureMapInterface.cpp
+index d8037f0..291591f 100644
+--- a/client/adventureMap/AdventureMapInterface.cpp
++++ b/client/adventureMap/AdventureMapInterface.cpp
+@@ -36,6 +36,7 @@
+ #include "../render/IScreenHandler.h"
+ #include "../PlayerLocalState.h"
+ #include "../CPlayerInterface.h"
++#include "../ClaudePlayer.h"
+ 
+ #include "../../lib/mapping/CMap.h"
+ #include "../../lib/GameLibrary.h"
+@@ -492,7 +493,7 @@ void AdventureMapInterface::hotkeyEndingTurn()
+ 	{
+ 		if (player != GAME->interface()->playerID && GAME->interface()->cb->isPlayerMakingTurn(player))
+ 		{
+-			onEnemyTurnStarted(player, GAME->interface()->cb->getStartInfo()->playerInfos.at(player).isControlledByHuman());
++			onEnemyTurnStarted(player, ClaudePlayer::isPerson(GAME->interface()->cb->getStartInfo()->playerInfos.at(player)));
+ 			break;
+ 		}
+ 	}
+diff --git a/client/adventureMap/AdventureMapWidget.cpp b/client/adventureMap/AdventureMapWidget.cpp
+index e3bc8d3..69695a5 100644
+--- a/client/adventureMap/AdventureMapWidget.cpp
++++ b/client/adventureMap/AdventureMapWidget.cpp
+@@ -9,6 +9,8 @@
+  */
+ #include "StdInc.h"
+ #include "AdventureMapWidget.h"
++#include "../render/Graphics.h"
++#include "../windows/ClaudeChatWindow.h"
+ 
+ #include "AdventureMapShortcuts.h"
+ #include "CInfoBar.h"
+@@ -60,6 +62,7 @@ AdventureMapWidget::AdventureMapWidget( std::shared_ptr<AdventureMapShortcuts> s
+ 	REGISTER_BUILDER("adventureStatusBar",          &AdventureMapWidget::buildStatusBar           );
+ 	REGISTER_BUILDER("adventurePlayerTexture",      &AdventureMapWidget::buildTexturePlayerColored);
+ 	REGISTER_BUILDER("adventureResourceAdditional", &AdventureMapWidget::buildResourceAdditional  );
++	REGISTER_BUILDER("claudeChatButton",            &AdventureMapWidget::buildClaudeChatButton    );
+ 
+ 	for (const auto & entry : shortcuts->getShortcuts())
+ 		addShortcut(entry.shortcut, entry.callback);
+@@ -262,6 +265,11 @@ std::shared_ptr<CIntObject> AdventureMapWidget::buildMapIcon(const JsonNode & in
+ 	return std::make_shared<CAdventureMapIcon>(area.topLeft(), AnimationPath::fromJson(input["image"]), index, perPlayer);
+ }
+ 
++std::shared_ptr<CIntObject> AdventureMapWidget::buildClaudeChatButton(const JsonNode & input)
++{
++	return std::make_shared<ClaudeChatButton>(readTargetArea(input["area"]));
++}
++
+ std::shared_ptr<CIntObject> AdventureMapWidget::buildMapTownList(const JsonNode & input)
+ {
+ 	Rect area = readTargetArea(input["area"]);
+@@ -448,7 +456,7 @@ CAdventureMapIcon::CAdventureMapIcon(const Point & position, const AnimationPath
+ 
+ void CAdventureMapIcon::setPlayerColor(const PlayerColor & player)
+ {
+-	image->setFrame(index + player.getNum() * iconsPerPlayer);
++	image->setFrame(index + graphics->shownColor(player).getNum() * iconsPerPlayer); // H3 Mod: shown colour
+ }
+ 
+ void CAdventureMapOverlayWidget::show(Canvas & to)
+diff --git a/client/adventureMap/AdventureMapWidget.h b/client/adventureMap/AdventureMapWidget.h
+index 3d8c00a..eeb2e2a 100644
+--- a/client/adventureMap/AdventureMapWidget.h
++++ b/client/adventureMap/AdventureMapWidget.h
+@@ -56,6 +56,7 @@ class AdventureMapWidget : public InterfaceObjectConfigurable
+ 	std::shared_ptr<CIntObject> buildStatusBar(const JsonNode & input);
+ 	std::shared_ptr<CIntObject> buildTexturePlayerColored(const JsonNode &);
+ 	std::shared_ptr<CIntObject> buildResourceAdditional(const JsonNode &);
++	std::shared_ptr<CIntObject> buildClaudeChatButton(const JsonNode & input); // H3 Mod local patch
+ 
+ 	void setPlayerChildren(CIntObject * widget, const PlayerColor & player);
+ 	void updateActiveStateChildren(CIntObject * widget);
+diff --git a/client/adventureMap/CInfoBar.cpp b/client/adventureMap/CInfoBar.cpp
+index ec33b69..64a22dd 100644
+--- a/client/adventureMap/CInfoBar.cpp
++++ b/client/adventureMap/CInfoBar.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "StdInc.h"
+ #include "CInfoBar.h"
++#include "../render/Graphics.h"
+ 
+ #include "AdventureMapInterface.h"
+ 
+@@ -126,7 +127,7 @@ CInfoBar::VisibleEnemyTurnInfo::VisibleEnemyTurnInfo(PlayerColor player)
+ {
+ 	OBJECT_CONSTRUCTION;
+ 	background = std::make_shared<CPicture>(ImagePath::builtin("ADSTATNX"));
+-	banner = std::make_shared<CAnimImage>(AnimationPath::builtin("CREST58"), player.getNum(), 0, 20, 51);
++	banner = std::make_shared<CAnimImage>(AnimationPath::builtin("CREST58"), graphics->shownColor(player).getNum(), 0, 20, 51);
+ 	sand = std::make_shared<CShowableAnim>(99, 51, AnimationPath::builtin("HOURSAND"), 0, 100); // H3 uses around 100 ms per frame
+ 	glass = std::make_shared<CShowableAnim>(99, 51, AnimationPath::builtin("HOURGLAS"), CShowableAnim::PLAY_ONCE, 1000); // H3 scales this nicely for AI turn duration, don't have anything like that in vcmi
+ }
+@@ -167,7 +168,7 @@ CInfoBar::VisibleGameStatusInfo::VisibleGameStatusInfo()
+ 	int posx = allyLabel->pos.w + allyLabel->pos.x - pos.x + 4;
+ 	for(PlayerColor & player : allies)
+ 	{
+-		auto image = std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS"), player.getNum(), 0, posx, 102);
++		auto image = std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS"), graphics->shownColor(player).getNum(), 0, posx, 102);
+ 		posx += image->pos.w;
+ 		flags.push_back(image);
+ 	}
+@@ -175,7 +176,7 @@ CInfoBar::VisibleGameStatusInfo::VisibleGameStatusInfo()
+ 	posx = enemyLabel->pos.w + enemyLabel->pos.x - pos.x + 4;
+ 	for(PlayerColor & player : enemies)
+ 	{
+-		auto image = std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS"), player.getNum(), 0, posx, 132);
++		auto image = std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS"), graphics->shownColor(player).getNum(), 0, posx, 132);
+ 		posx += image->pos.w;
+ 		flags.push_back(image);
+ 	}
+diff --git a/client/battle/BattleWindow.cpp b/client/battle/BattleWindow.cpp
+index 256c026..59dd0db 100644
+--- a/client/battle/BattleWindow.cpp
++++ b/client/battle/BattleWindow.cpp
+@@ -22,6 +22,7 @@
+ #include "UnitActionPanel.h"
+ 
+ #include "../CPlayerInterface.h"
++#include "../ClaudePlayer.h"
+ #include "../GameEngine.h"
+ #include "../GameInstance.h"
+ #include "../adventureMap/CInGameConsole.h"
+@@ -65,8 +66,8 @@ BattleWindow::BattleWindow(BattleInterface & Owner)
+ 
+ 	PlayerColor defenderColor = owner.getBattle()->getBattle()->getSidePlayer(BattleSide::DEFENDER);
+ 	PlayerColor attackerColor = owner.getBattle()->getBattle()->getSidePlayer(BattleSide::ATTACKER);
+-	bool isDefenderHuman = defenderColor.isValidPlayer() && GAME->interface()->cb->getStartInfo()->playerInfos.at(defenderColor).isControlledByHuman();
+-	bool isAttackerHuman = attackerColor.isValidPlayer() && GAME->interface()->cb->getStartInfo()->playerInfos.at(attackerColor).isControlledByHuman();
++	bool isDefenderHuman = defenderColor.isValidPlayer() && ClaudePlayer::isPerson(GAME->interface()->cb->getStartInfo()->playerInfos.at(defenderColor));
++	bool isAttackerHuman = attackerColor.isValidPlayer() && ClaudePlayer::isPerson(GAME->interface()->cb->getStartInfo()->playerInfos.at(attackerColor));
+ 	onlyOnePlayerHuman = isDefenderHuman != isAttackerHuman;
+ 
+ 	REGISTER_BUILDER("battleConsole", &BattleWindow::buildBattleConsole);
+diff --git a/client/lobby/CLobbyScreen.cpp b/client/lobby/CLobbyScreen.cpp
+index 13fc5d5..0e04522 100644
+--- a/client/lobby/CLobbyScreen.cpp
++++ b/client/lobby/CLobbyScreen.cpp
+@@ -17,9 +17,11 @@
+ #include "RandomMapTab.h"
+ #include "SelectionTab.h"
+ #include "BattleOnlyModeTab.h"
++#include "ClaudeSeatsWindow.h"
+ 
+ #include "../CServerHandler.h"
+ #include "../GameEngine.h"
++#include "../gui/WindowHandler.h"
+ #include "../GameChatHandler.h"
+ #include "../GameInstance.h"
+ #include "../gui/Shortcut.h"
+@@ -71,6 +73,15 @@ CLobbyScreen::CLobbyScreen(ESelectionScreen screenType, bool hideScreen)
+ 				}, EShortcut::LOBBY_BATTLE_MODE);
+ 			buttonExtraOptions = std::make_shared<CButton>(Point(619, 510), AnimationPath::builtin("GSPButton2Arrow"), LIBRARY->generaltexth->zelp[46], std::bind(&CLobbyScreen::toggleTab, this, tabExtraOptions), EShortcut::LOBBY_EXTRA_OPTIONS);
+ 		}
++
++		// H3 Mod local patch: shown colours and seats for Claude, where the network lobby has its chat button
++		if(!buttonChat)
++		{
++			buttonClaudeSeats = std::make_shared<CButton>(Point(619, 105), AnimationPath::builtin("GSPBUT2.DEF"),
++				CButton::tooltip("颜色和 Claude", "每个颜色显示成什么颜色，哪个颜色交给 Claude 来打"),
++				[]() { ENGINE->windows().createAndPushWindow<ClaudeSeatsWindow>(); });
++			buttonClaudeSeats->setTextOverlay("颜色和 Claude", FONT_SMALL, Colors::WHITE);
++		}
+ 	};
+ 
+ 	if(screenType != ESelectionScreen::campaignList && isMultiplayerNetworkLobby())
+diff --git a/client/lobby/CLobbyScreen.h b/client/lobby/CLobbyScreen.h
+index c0d7ec8..fc33720 100644
+--- a/client/lobby/CLobbyScreen.h
++++ b/client/lobby/CLobbyScreen.h
+@@ -36,6 +36,7 @@ public:
+ 
+ private:
+ 	std::shared_ptr<CButton> buttonChat;
++	std::shared_ptr<CButton> buttonClaudeSeats; // H3 Mod: ClaudeSeatsWindow
+ 	std::shared_ptr<GraphicalPrimitiveCanvas> blackScreen;
+ 
+ 	bool waitingForPlayersMessageShown = false;
+diff --git a/client/lobby/CSelectionBase.cpp b/client/lobby/CSelectionBase.cpp
+index 209d3f8..443b41b 100644
+--- a/client/lobby/CSelectionBase.cpp
++++ b/client/lobby/CSelectionBase.cpp
+@@ -591,7 +591,7 @@ void CFlagBox::recreate()
+ 	const int enemiesX = 5 + 133 + (int)labelEnemies->getWidth();
+ 	for(auto i = GAME->server().si->playerInfos.cbegin(); i != GAME->server().si->playerInfos.cend(); i++)
+ 	{
+-		auto flag = std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS.DEF"), i->first.getNum(), 0);
++		auto flag = std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS.DEF"), graphics->shownColor(i->first).getNum(), 0);
+ 		if(i->first == GAME->server().myFirstColor() || GAME->server().getPlayerTeamId(i->first) == GAME->server().getPlayerTeamId(GAME->server().myFirstColor()))
+ 		{
+ 			flag->moveTo(Point(pos.x + alliesX + (int)flagsAllies.size()*flag->pos.w, pos.y));
+@@ -639,7 +639,7 @@ CFlagBox::CFlagBoxTooltipBox::CFlagBoxTooltipBox()
+ 		int curx = 128 - 9 * team.size();
+ 		for(const auto & player : team)
+ 		{
+-			iconsFlags.push_back(std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS.DEF"), player, 0, curx, 75 + 50 * curIdx));
++			iconsFlags.push_back(std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS.DEF"), graphics->shownColor(PlayerColor(player)).getNum(), 0, curx, 75 + 50 * curIdx));
+ 			curx += 18;
+ 		}
+ 		++curIdx;
+diff --git a/client/lobby/ClaudeSeatsWindow.cpp b/client/lobby/ClaudeSeatsWindow.cpp
+new file mode 100644
+index 0000000..0bb1a16
+--- /dev/null
++++ b/client/lobby/ClaudeSeatsWindow.cpp
+@@ -0,0 +1,167 @@
++/*
++ * ClaudeSeatsWindow.cpp, H3 Mod local patch (not part of VCMI)
++ *
++ * License: GNU General Public License v2.0 or later
++ *
++ */
++#include "StdInc.h"
++#include "ClaudeSeatsWindow.h"
++
++#include "CLobbyScreen.h"
++#include "../ClaudePlayer.h"
++#include "../CServerHandler.h"
++#include "../GameEngine.h"
++#include "../GameInstance.h"
++#include "../gui/Shortcut.h"
++#include "../gui/WindowHandler.h"
++#include "../render/Colors.h"
++#include "../render/Graphics.h"
++#include "../widgets/Buttons.h"
++#include "../widgets/Images.h"
++#include "../widgets/TextControls.h"
++
++#include "../../lib/StartInfo.h"
++
++namespace
++{
++// the real colour names; the game's own colour names follow the shown colours
++const char * const colorNames[] = {"红", "蓝", "棕", "绿", "橙", "紫", "青", "粉"};
++
++constexpr int rowTop = 64;
++constexpr int rowHeight = 34;
++}
++
++ClaudeSeatsWindow::ClaudeSeatsWindow()
++	: CWindowObject(BORDERED)
++{
++	OBJECT_CONSTRUCTION;
++	const int count = GAME->server().si ? static_cast<int>(GAME->server().si->playerInfos.size()) : 0;
++	pos.w = 540;
++	pos.h = rowTop + rowHeight * std::max(1, count) + 120;
++
++	background = std::make_shared<CFilledTexture>(ImagePath::builtin("DIBOXBCK"), Rect(0, 0, pos.w, pos.h));
++	title = std::make_shared<CLabel>(pos.w / 2, 22, FONT_BIG, ETextAlignment::CENTER, Colors::YELLOW, "颜色和 Claude");
++	columnLabel = std::make_shared<CLabel>(24, 48, FONT_SMALL, ETextAlignment::CENTERLEFT, Colors::YELLOW, "地图上的颜色");
++	hint = std::make_shared<CMultiLineLabel>(Rect(20, pos.h - 104, pos.w - 40, 64), FONT_SMALL, ETextAlignment::TOPLEFT, Colors::WHITE,
++		"「显示成」只换画面：旗子、界面、名字都换成另一个颜色，规则和存档不变，所有游戏都这样显示。"
++		"「Claude 来打」把一个电脑颜色交给 Claude（没有 Claude 窗口回应时由电脑代打）；热座里的人类座位，把名字填成 Claude 就行。");
++	closeButton = std::make_shared<CButton>(Point(pos.w / 2 - 32, pos.h - 38), AnimationPath::builtin("IOKAY"), CButton::tooltip("关闭"), [this]() { close(); }, EShortcut::GLOBAL_RETURN);
++
++	rebuild();
++	addUsedEvents(TIME);
++	center();
++}
++
++std::string ClaudeSeatsWindow::currentState() const
++{
++	std::string state;
++	if(GAME->server().si)
++		for(const auto & [color, settings] : GAME->server().si->playerInfos)
++			state += std::to_string(color.getNum()) + ":" + settings.name + ":" + (settings.isControlledByHuman() ? "h" : "a") + ";";
++	for(const auto & shown : graphics->getShownColors())
++		state += std::to_string(shown.getNum());
++	return state;
++}
++
++void ClaudeSeatsWindow::rebuild()
++{
++	OBJECT_CONSTRUCTION;
++	rows.clear();
++	shownState = currentState();
++	if(!GAME->server().si || GAME->server().si->playerInfos.empty())
++	{
++		rows.push_back(std::make_shared<CLabel>(24, rowTop + 16, FONT_MEDIUM, ETextAlignment::CENTERLEFT, Colors::WHITE, "先选一张地图"));
++		return;
++	}
++
++	const bool host = !GAME->server().isGuest();
++	int y = rowTop;
++	for(const auto & [color, settings] : GAME->server().si->playerInfos)
++	{
++		if(!color.isValidPlayer() || color.getNum() >= 8)
++			continue;
++		const PlayerColor shown = graphics->shownColor(color);
++		rows.push_back(std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS"), shown.getNum(), 0, 22, y + 6));
++		rows.push_back(std::make_shared<CLabel>(50, y + 16, FONT_MEDIUM, ETextAlignment::CENTERLEFT, Colors::WHITE, std::string(colorNames[color.getNum()]) + "方"));
++
++		const bool claude = ClaudePlayer::isClaudeName(settings.name);
++		std::string who;
++		if(settings.isControlledByHuman())
++			who = claude ? "Claude（热座）" : settings.name;
++		else
++			who = claude ? "Claude" : "电脑";
++		rows.push_back(std::make_shared<CLabel>(104, y + 16, FONT_SMALL, ETextAlignment::CENTERLEFT, claude ? Colors::YELLOW : Colors::WHITE, who));
++
++		auto shownButton = std::make_shared<CButton>(Point(232, y + 2), AnimationPath::builtin("GSPBUT2.DEF"), CButton::tooltip("显示成", "点一下换成下一个颜色：两个颜色互相对调，别的颜色不变"),
++			[this, color]() { cycleShownColor(color); });
++		shownButton->setTextOverlay("显示成" + std::string(colorNames[shown.getNum()]), FONT_SMALL, Colors::WHITE);
++		rows.push_back(shownButton);
++
++		if(!settings.isControlledByHuman())
++		{
++			auto claudeButton = std::make_shared<CButton>(Point(380, y + 2), AnimationPath::builtin("GSPBUT2.DEF"), CButton::tooltip("Claude 来打", "把这个电脑颜色交给 Claude，或者还给电脑"),
++				[this, color, claude]() { toggleClaude(color, !claude); });
++			claudeButton->setTextOverlay(claude ? "还给电脑" : "Claude 来打", FONT_SMALL, claude ? Colors::YELLOW : Colors::WHITE);
++			if(!host)
++				claudeButton->block(true);
++			rows.push_back(claudeButton);
++		}
++		y += rowHeight;
++	}
++	redraw();
++}
++
++void ClaudeSeatsWindow::cycleShownColor(PlayerColor color)
++{
++	// colours are swapped in pairs: red shown as purple means purple is shown as red, nobody else changes
++	auto shown = graphics->getShownColors();
++	for(int i = 0; i < 8; ++i)
++		if(shown[shown[i].getNum()].getNum() != i)
++		{
++			for(int j = 0; j < 8; ++j)
++				shown[j] = PlayerColor(j); // not pairs (edited by hand): start over
++			break;
++		}
++	auto unpair = [&shown](int c)
++	{
++		const int partner = shown[c].getNum();
++		shown[c] = PlayerColor(c);
++		shown[partner] = PlayerColor(partner);
++	};
++	const int c = color.getNum();
++	const int next = (shown[c].getNum() + 1) % 8;
++	unpair(c);
++	if(next != c)
++	{
++		unpair(next);
++		shown[c] = PlayerColor(next);
++		shown[next] = PlayerColor(c);
++	}
++	graphics->setShownColors(shown);
++	rebuild();
++}
++
++void ClaudeSeatsWindow::toggleClaude(PlayerColor color, bool claude)
++{
++	GAME->server().setPlayerName(color, claude ? "Claude" : "");
++	// the lobby state comes back from the server; tick() notices and rebuilds
++}
++
++void ClaudeSeatsWindow::tick(uint32_t msPassed)
++{
++	sinceCheck += msPassed;
++	if(sinceCheck < 250)
++		return;
++	sinceCheck = 0;
++	if(currentState() != shownState)
++		rebuild();
++}
++
++void ClaudeSeatsWindow::close()
++{
++	CWindowObject::close();
++	// the flags and row backgrounds behind us follow the shown colours
++	if(auto lobby = ENGINE->windows().topWindow<CLobbyScreen>())
++		lobby->updateAfterStateChange();
++	ENGINE->windows().totalRedraw();
++}
+diff --git a/client/lobby/ClaudeSeatsWindow.h b/client/lobby/ClaudeSeatsWindow.h
+new file mode 100644
+index 0000000..704dac3
+--- /dev/null
++++ b/client/lobby/ClaudeSeatsWindow.h
+@@ -0,0 +1,40 @@
++/*
++ * ClaudeSeatsWindow.h, H3 Mod local patch (not part of VCMI)
++ *
++ * License: GNU General Public License v2.0 or later
++ *
++ */
++#pragma once
++
++#include "../windows/CWindowObject.h"
++
++class CButton;
++class CFilledTexture;
++class CLabel;
++class CMultiLineLabel;
++
++/// Lobby window "颜色和 Claude": for every colour of the chosen map, which colour it is shown as
++/// (Graphics::setShownColors: display only, for all games) and whether Claude plays it
++/// (an AI seat named "Claude", see ClaudePlayer.h; hotseat seats are named in the hotseat dialog)
++class ClaudeSeatsWindow : public CWindowObject
++{
++	std::shared_ptr<CFilledTexture> background;
++	std::shared_ptr<CLabel> title;
++	std::shared_ptr<CLabel> columnLabel;
++	std::shared_ptr<CMultiLineLabel> hint;
++	std::vector<std::shared_ptr<CIntObject>> rows;
++	std::shared_ptr<CButton> closeButton;
++	std::string shownState;
++	uint32_t sinceCheck = 0;
++
++	std::string currentState() const;
++	void rebuild();
++	void cycleShownColor(PlayerColor color);
++	void toggleClaude(PlayerColor color, bool claude);
++
++public:
++	ClaudeSeatsWindow();
++
++	void tick(uint32_t msPassed) override;
++	void close() override;
++};
+diff --git a/client/lobby/OptionsTab.cpp b/client/lobby/OptionsTab.cpp
+index edf3c77..021bff2 100644
+--- a/client/lobby/OptionsTab.cpp
++++ b/client/lobby/OptionsTab.cpp
+@@ -827,7 +827,7 @@ OptionsTab::HandicapWindow::HandicapWindow()
+ 	for(auto & pInfo : SEL->getStartInfo()->playerInfos)
+ 	{
+ 		PlayerColor player = pInfo.first;
+-		anim.push_back(std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS"), player.getNum(), 0, 7, 57 + i * 30));
++		anim.push_back(std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS"), graphics->shownColor(player).getNum(), 0, 7, 57 + i * 30));
+ 		for(int j = 0; j < columns.size(); j++)
+ 		{
+ 			bool isIncome = int(columns[j]) == Columns::INCOME;
+@@ -1013,7 +1013,9 @@ OptionsTab::PlayerOptionsEntry::PlayerOptionsEntry(const PlayerSettings & S, con
+ 	assert(GAME->server().mi && GAME->server().mi->mapHeader);
+ 	const PlayerInfo & p = SEL->getPlayerInfo(s->color);
+ 	assert(p.canComputerPlay || p.canHumanPlay); //someone must be able to control this player
+-	if(p.canHumanPlay && p.canComputerPlay)
++	// H3 Mod local patch: outside campaigns a person may also take a colour the map gives to the computer only
++	const bool campaign = GAME->server().si && GAME->server().si->campState;
++	if(p.canComputerPlay && (p.canHumanPlay || !campaign))
+ 		whoCanPlay = HUMAN_OR_CPU;
+ 	else if(p.canComputerPlay)
+ 		whoCanPlay = CPU;
+@@ -1031,7 +1033,7 @@ OptionsTab::PlayerOptionsEntry::PlayerOptionsEntry(const PlayerSettings & S, con
+ 		"ADOPOPNL.bmp", "ADOPPPNL.bmp", "ADOPTPNL.bmp", "ADOPSPNL.bmp"
+ 	}};
+ 
+-	background = std::make_shared<CPicture>(ImagePath::builtin(bgs[s->color]), 0, 0);
++	background = std::make_shared<CPicture>(ImagePath::builtin(bgs[graphics->shownColor(s->color).getNum()]), 0, 0);
+ 	if(s->isControlledByAI() || GAME->server().isGuest())
+ 		labelPlayerName = std::make_shared<CLabel>(55, 10, EFonts::FONT_SMALL, ETextAlignment::CENTER, Colors::WHITE, name, 95);
+ 	else
+@@ -1092,11 +1094,11 @@ OptionsTab::PlayerOptionsEntry::PlayerOptionsEntry(const PlayerSettings & S, con
+ 
+ 	hideUnavailableButtons();
+ 
+-	if(SEL->screenType != ESelectionScreen::scenarioInfo && SEL->getPlayerInfo(s->color).canHumanPlay)
++	if(SEL->screenType != ESelectionScreen::scenarioInfo && (SEL->getPlayerInfo(s->color).canHumanPlay || whoCanPlay == HUMAN_OR_CPU)) // H3 Mod: any colour
+ 	{
+ 		flag = std::make_shared<CButton>(
+ 			Point(-43, 2),
+-			AnimationPath::builtin(flags[s->color.getNum()]),
++			AnimationPath::builtin(flags[graphics->shownColor(s->color).getNum()]),
+ 			LIBRARY->generaltexth->zelp[180],
+ 			std::bind(&OptionsTab::onSetPlayerClicked, &parentTab, *s)
+ 		);
+diff --git a/client/mainmenu/CStatisticScreen.cpp b/client/mainmenu/CStatisticScreen.cpp
+index d3b5dc7..7d3c883 100644
+--- a/client/mainmenu/CStatisticScreen.cpp
++++ b/client/mainmenu/CStatisticScreen.cpp
+@@ -415,7 +415,7 @@ void OverviewPanel::update(int to)
+ 		for(int x = 0; x < PlayerColor::PLAYER_LIMIT_I + 1; x++)
+ 		{
+ 			if(y == to && x < PlayerColor::PLAYER_LIMIT_I)
+-				content.emplace_back(std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS"), x, 0, 180 + x * fieldSize.x, 35));
++				content.emplace_back(std::make_shared<CAnimImage>(AnimationPath::builtin("ITGFLAGS"), graphics->shownColor(PlayerColor(x)).getNum(), 0, 180 + x * fieldSize.x, 35));
+ 			int xStart = (x + (x == 0 ? 0 : 1)) * fieldSize.x + (x == 0 ? fieldSize.x : (fieldSize.x / 2));
+ 			int yStart = Y_OFFS + (y + 1 - to) * fieldSize.y + (fieldSize.y / 2);
+ 			PlayerColor tmpColor(x - 1);
+diff --git a/client/mapView/MapRenderer.cpp b/client/mapView/MapRenderer.cpp
+index bcbd7cf..46c6db3 100644
+--- a/client/mapView/MapRenderer.cpp
++++ b/client/mapView/MapRenderer.cpp
+@@ -452,14 +452,14 @@ std::shared_ptr<CAnimation> MapRendererObjects::getFlagAnimation(const CGObjectI
+ 	{
+ 		assert(dynamic_cast<const CGHeroInstance *>(obj) != nullptr);
+ 		assert(obj->tempOwner.isValidPlayer());
+-		return getAnimation(AnimationPath::builtin(heroFlags[obj->tempOwner.getNum()]), true, false);
++		return getAnimation(AnimationPath::builtin(heroFlags[graphics->shownColor(obj->tempOwner).getNum()]), true, false);
+ 	}
+ 
+ 	if(obj->ID == Obj::BOAT)
+ 	{
+ 		const auto * boat = dynamic_cast<const CGBoat *>(obj);
+-		if(boat && boat->getBoardedHero() && !boat->flagAnimations[boat->getBoardedHero()->tempOwner.getNum()].empty())
+-			return getAnimation(boat->flagAnimations[boat->getBoardedHero()->tempOwner.getNum()], true, false);
++		if(boat && boat->getBoardedHero() && !boat->flagAnimations[graphics->shownColor(boat->getBoardedHero()->tempOwner).getNum()].empty())
++			return getAnimation(boat->flagAnimations[graphics->shownColor(boat->getBoardedHero()->tempOwner).getNum()], true, false);
+ 	}
+ 
+ 	return nullptr;
+diff --git a/client/mapView/MapRendererContext.cpp b/client/mapView/MapRendererContext.cpp
+index 921d171..62657fe 100644
+--- a/client/mapView/MapRendererContext.cpp
++++ b/client/mapView/MapRendererContext.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "StdInc.h"
+ #include "MapRendererContext.h"
++#include "../render/Graphics.h"
+ 
+ #include "MapRendererContextState.h"
+ #include "mapHandler.h"
+@@ -485,7 +486,7 @@ size_t MapRendererWorldViewContext::selectOverlayImageForObject(const ObjectPosI
+ 	size_t ownerIndex = PlayerColor::PLAYER_LIMIT.getNum() * static_cast<size_t>(EWorldViewIcon::ICONS_PER_PLAYER);
+ 
+ 	if(object.owner.isValidPlayer())
+-		ownerIndex = object.owner.getNum() * static_cast<size_t>(EWorldViewIcon::ICONS_PER_PLAYER);
++		ownerIndex = graphics->shownColor(object.owner).getNum() * static_cast<size_t>(EWorldViewIcon::ICONS_PER_PLAYER);
+ 
+ 	switch(object.id)
+ 	{
+diff --git a/client/mapView/MapViewActions.cpp b/client/mapView/MapViewActions.cpp
+index 4efb5be..d65aba1 100644
+--- a/client/mapView/MapViewActions.cpp
++++ b/client/mapView/MapViewActions.cpp
+@@ -42,6 +42,18 @@ void MapViewActions::setContext(const std::shared_ptr<IMapRendererContext> & con
+ 	this->context = context;
+ }
+ 
++void MapViewActions::clickPressed(const Point & cursorPosition, bool lastActivated)
++{
++	if(lastActivated)
++		clickPressed(cursorPosition);
++}
++
++void MapViewActions::clickReleased(const Point & cursorPosition, bool lastActivated)
++{
++	if(lastActivated)
++		clickReleased(cursorPosition);
++}
++
+ void MapViewActions::clickPressed(const Point & cursorPosition)
+ {
+ 	if (!settings["adventure"]["leftButtonDrag"].Bool())
+diff --git a/client/mapView/MapViewActions.h b/client/mapView/MapViewActions.h
+index 89fdca3..bacb01d 100644
+--- a/client/mapView/MapViewActions.h
++++ b/client/mapView/MapViewActions.h
+@@ -34,6 +34,9 @@ public:
+ 
+ 	void clickPressed(const Point & cursorPosition) override;
+ 	void clickReleased(const Point & cursorPosition) override;
++	/// H3 Mod local patch: ignore clicks that a widget over the map (the 回声 gem) already took
++	void clickPressed(const Point & cursorPosition, bool lastActivated) override;
++	void clickReleased(const Point & cursorPosition, bool lastActivated) override;
+ 	void clickCancel(const Point & cursorPosition) override;
+ 	void showPopupWindow(const Point & cursorPosition) override;
+ 	void closePopupWindow(bool alreadyClosed) override;
+diff --git a/client/mapView/MapViewController.cpp b/client/mapView/MapViewController.cpp
+index 4689920..ffb1b8a 100644
+--- a/client/mapView/MapViewController.cpp
++++ b/client/mapView/MapViewController.cpp
+@@ -17,6 +17,7 @@
+ #include "MapViewModel.h"
+ 
+ #include "../CPlayerInterface.h"
++#include "../ClaudePlayer.h"
+ #include "../adventureMap/AdventureMapInterface.h"
+ #include "../GameEngine.h"
+ #include "../GameInstance.h"
+@@ -320,7 +321,7 @@ bool MapViewController::isEventVisible(const CGObjectInstance * obj, const Playe
+ 	{
+ 		if (GAME->interface()->makingTurn)
+ 			return false;
+-		if (GAME->interface()->cb->getStartInfo()->playerInfos.at(initiator).isControlledByHuman() && !settings["session"]["adventureTrackHero"].Bool())
++		if (ClaudePlayer::isPerson(GAME->interface()->cb->getStartInfo()->playerInfos.at(initiator)) && !settings["session"]["adventureTrackHero"].Bool())
+ 			return false;
+ 	}
+ 
+@@ -346,7 +347,7 @@ bool MapViewController::isEventVisible(const CGHeroInstance * obj, const int3 &
+ 	{
+ 		if (GAME->interface()->makingTurn)
+ 			return false;
+-		if (GAME->interface()->cb->getStartInfo()->playerInfos.at(obj->getOwner()).isControlledByHuman() && !settings["session"]["adventureTrackHero"].Bool())
++		if (ClaudePlayer::isPerson(GAME->interface()->cb->getStartInfo()->playerInfos.at(obj->getOwner())) && !settings["session"]["adventureTrackHero"].Bool())
+ 			return false;
+ 	}
+ 
+diff --git a/client/render/AssetGenerator.cpp b/client/render/AssetGenerator.cpp
+index 5d9df6b..db71a05 100644
+--- a/client/render/AssetGenerator.cpp
++++ b/client/render/AssetGenerator.cpp
+@@ -9,6 +9,7 @@
+  */
+ #include "StdInc.h"
+ #include "AssetGenerator.h"
++#include "../render/Graphics.h"
+ 
+ #include "../GameEngine.h"
+ #include "../render/IImage.h"
+@@ -332,7 +333,7 @@ AssetGenerator::CanvasPtr AssetGenerator::createPlayerColoredBackground(const Pl
+ 	if (!player.isValidPlayer())
+ 		throw std::runtime_error("Unable to colorize to invalid player color" + std::to_string(player.getNum()));
+ 
+-	texture->adjustPalette(filters[player.getNum()], 0);
++	texture->adjustPalette(filters[graphics->shownColor(player).getNum()], 0); // H3 Mod: shown colour
+ 
+ 	auto image = ENGINE->renderHandler().createImage(texture->dimensions(), CanvasScalingPolicy::IGNORE);
+ 	Canvas canvas = image->getCanvas();
+diff --git a/client/render/Graphics.cpp b/client/render/Graphics.cpp
+index 61623f2..9714fe9 100644
+--- a/client/render/Graphics.cpp
++++ b/client/render/Graphics.cpp
+@@ -28,6 +28,9 @@
+ #include "../lib/modding/CModHandler.h"
+ #include "../lib/modding/ModScope.h"
+ #include "../lib/GameLibrary.h"
++#include "../lib/VCMIDirs.h"
++#include "../lib/constants/StringConstants.h"
++#include "../lib/texts/TextLocalizationContainer.h"
+ 
+ #include <SDL_surface.h>
+ 
+@@ -85,6 +88,78 @@ void Graphics::loadPaletteAndColors()
+ 	neutralColor.g = 0x84;
+ 	neutralColor.b = 0x84;
+ 	neutralColor.a = SDL_ALPHA_OPAQUE;
++
++	// H3 Mod local patch: shown colours, see Graphics.h
++	basePlayerColors = playerColors;
++	basePlayerColorPalette = playerColorPalette;
++	for(int i = 0; i < 8; ++i)
++		shownColors[i] = PlayerColor(i);
++	const auto path = VCMIDirs::get().userConfigPath() / "h3mod-colors.json";
++	boost::system::error_code ec;
++	if(boost::filesystem::exists(path, ec))
++	{
++		try
++		{
++			std::ifstream in(path.c_str(), std::ios::binary);
++			const std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++			const JsonNode config(data.data(), data.size(), "h3mod-colors.json");
++			std::array<PlayerColor, 8> shown = shownColors;
++			std::set<int> seen;
++			for(int i = 0; i < 8 && i < static_cast<int>(config["shown"].Vector().size()); ++i)
++			{
++				const auto & names = GameConstants::PLAYER_COLOR_NAMES;
++				const auto it = std::find(std::begin(names), std::end(names), config["shown"].Vector()[i].String());
++				if(it != std::end(names))
++					shown[i] = PlayerColor(static_cast<int>(it - std::begin(names)));
++			}
++			for(const auto & color : shown)
++				seen.insert(color.getNum());
++			if(seen.size() == 8)
++				shownColors = shown;
++			else
++				logGlobal->error("h3mod-colors.json: \"shown\" must name each of the 8 colours once, ignored");
++		}
++		catch(const std::exception & e)
++		{
++			logGlobal->error("Cannot read %s: %s", path.string(), e.what());
++		}
++	}
++	applyShownColors();
++}
++
++void Graphics::applyShownColors()
++{
++	std::array<int, 8> names;
++	for(int i = 0; i < 8; ++i)
++	{
++		playerColors[i] = basePlayerColors[shownColors[i].getNum()];
++		playerColorPalette[i] = basePlayerColorPalette[shownColors[i].getNum()];
++		names[i] = shownColors[i].getNum();
++	}
++	TextLocalizationContainer::setShownPlayerColors(names);
++}
++
++PlayerColor Graphics::shownColor(PlayerColor player) const
++{
++	return player.isValidPlayer() && player.getNum() < 8 ? shownColors[player.getNum()] : player;
++}
++
++const std::array<PlayerColor, 8> & Graphics::getShownColors() const
++{
++	return shownColors;
++}
++
++void Graphics::setShownColors(const std::array<PlayerColor, 8> & shown)
++{
++	shownColors = shown;
++	applyShownColors();
++	std::string text = "{\n\t\"shown\": [";
++	for(int i = 0; i < 8; ++i)
++		text += std::string(i ? ", " : "") + "\"" + GameConstants::PLAYER_COLOR_NAMES[shownColors[i].getNum()] + "\"";
++	text += "],\n\t\"note\": \"H3 Mod: entry i is the colour player colour i is shown as (red, blue, tan, green, orange, purple, teal, pink). Display only.\"\n}\n";
++	const auto path = VCMIDirs::get().userConfigPath() / "h3mod-colors.json";
++	std::ofstream out(path.c_str(), std::ios::binary | std::ios::trunc);
++	out << text;
+ }
+ 
+ void Graphics::initializeBattleGraphics()
+diff --git a/client/render/Graphics.h b/client/render/Graphics.h
+index 9ce7d8f..990efae 100644
+--- a/client/render/Graphics.h
++++ b/client/render/Graphics.h
+@@ -39,6 +39,22 @@ public:
+ 
+ 	void setPlayerPalette(SDL_Palette * sur, PlayerColor player);
+ 	void setPlayerFlagColor(SDL_Palette * sur, PlayerColor player);
++
++	/// H3 Mod local patch: a player colour can be shown as another colour. Flags, interface, dialog frames,
++	/// minimap and the colour's name all look like shownColor(player); game rules, saves and the network
++	/// don't change. The choice lives in <user config>/h3mod-colors.json, is set in the lobby
++	/// (client/lobby/ClaudeSeatsWindow) and is always a permutation, so two players never look alike.
++	PlayerColor shownColor(PlayerColor player) const;
++	/// shown[i] for each player colour i
++	const std::array<PlayerColor, 8> & getShownColors() const;
++	/// apply and save
++	void setShownColors(const std::array<PlayerColor, 8> & shown);
++
++private:
++	std::array<ColorRGBA, 8> basePlayerColors;
++	std::array<PlayerPalette, 8> basePlayerColorPalette;
++	std::array<PlayerColor, 8> shownColors;
++	void applyShownColors();
+ };
+ 
+ extern Graphics * graphics;
+diff --git a/client/renderSDL/RenderHandler.cpp b/client/renderSDL/RenderHandler.cpp
+index 72c9d58..5d60379 100644
+--- a/client/renderSDL/RenderHandler.cpp
++++ b/client/renderSDL/RenderHandler.cpp
+@@ -9,6 +9,7 @@
+  */
+ #include "StdInc.h"
+ #include "RenderHandler.h"
++#include "../render/Graphics.h"
+ 
+ #include "SDLImage.h"
+ #include "ScalableImage.h"
+@@ -372,7 +373,7 @@ std::shared_ptr<SDLImageShared> RenderHandler::loadScaledImage(const ImageLocato
+ 	if(shadow)
+ 		imagePathString += "-SHADOW";
+ 	if(locator.playerColored.isValidPlayer())
+-		imagePathString += "-" + boost::to_upper_copy(GameConstants::PLAYER_COLOR_NAMES[locator.playerColored.getNum()]);
++		imagePathString += "-" + boost::to_upper_copy(GameConstants::PLAYER_COLOR_NAMES[graphics->shownColor(locator.playerColored).getNum()]); // H3 Mod: shown colour
+ 	if(locator.playerColored == PlayerColor::NEUTRAL)
+ 		imagePathString += "-NEUTRAL";
+ 
+diff --git a/client/renderSDL/ScreenHandler.cpp b/client/renderSDL/ScreenHandler.cpp
+index 09819e1..76f037d 100644
+--- a/client/renderSDL/ScreenHandler.cpp
++++ b/client/renderSDL/ScreenHandler.cpp
+@@ -219,6 +219,9 @@ ScreenHandler::ScreenHandler()
+ 	// However this fixed unintuitive bug where player selects specific resolution for windowed mode, but ends up with completely different one due to scaling
+ 	// NOTE: requires SDL 2.24.
+ 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitor");
++	// H3 Mod local patch: let Windows draw the IME candidate list, so Chinese (Microsoft Pinyin)
++	// can be typed in the 回声 window and the chat bar; SDL hides it by default
++	SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
+ #endif
+ 	if(settings["video"]["allowPortrait"].Bool())
+ 		SDL_SetHint(SDL_HINT_ORIENTATIONS, "Portrait PortraitUpsideDown LandscapeLeft LandscapeRight");
+diff --git a/client/widgets/CComponent.cpp b/client/widgets/CComponent.cpp
+index 2e0df7e..72ed0bb 100644
+--- a/client/widgets/CComponent.cpp
++++ b/client/widgets/CComponent.cpp
+@@ -217,7 +217,7 @@ size_t CComponent::getIndex() const
+ 		case ComponentType::HERO_PORTRAIT:
+ 			return LIBRARY->heroTypes()->getById(data.subType.as<HeroTypeID>())->getIconIndex();
+ 		case ComponentType::FLAG:
+-			return data.subType.getNum();
++			return graphics->shownColor(data.subType.as<PlayerColor>()).getNum(); // H3 Mod: shown colour
+ 		default:
+ 			assert(0);
+ 			return 0;
+diff --git a/client/windows/CCastleInterface.cpp b/client/windows/CCastleInterface.cpp
+index 32998c8..5ab32de 100644
+--- a/client/windows/CCastleInterface.cpp
++++ b/client/windows/CCastleInterface.cpp
+@@ -9,6 +9,7 @@
+  */
+ #include "StdInc.h"
+ #include "CCastleInterface.h"
++#include "../render/Graphics.h"
+ 
+ #include "CHeroWindow.h"
+ #include "CMarketWindow.h"
+@@ -648,7 +649,7 @@ void CHeroGSlot::set(const CGHeroInstance * newHero)
+ 	else if(!upg && owner->showEmpty) //up garrison
+ 	{
+ 		flag->visible = true;
+-		flag->setFrame(GAME->interface()->castleInt->town->getOwner().getNum());
++		flag->setFrame(graphics->shownColor(GAME->interface()->castleInt->town->getOwner()).getNum());
+ 	}
+ }
+ 
+diff --git a/client/windows/CHeroWindow.cpp b/client/windows/CHeroWindow.cpp
+index 507d301..fddb8d7 100644
+--- a/client/windows/CHeroWindow.cpp
++++ b/client/windows/CHeroWindow.cpp
+@@ -9,6 +9,7 @@
+  */
+ #include "StdInc.h"
+ #include "CHeroWindow.h"
++#include "../render/Graphics.h"
+ #include "wiki/WikiWindow.h"
+ 
+ #include "CCreatureWindow.h"
+@@ -78,7 +79,7 @@ CHeroWindow::CHeroWindow(const CGHeroInstance * hero)
+ 	OBJECT_CONSTRUCTION;
+ 	curHero = hero;
+ 
+-	banner = std::make_shared<CAnimImage>(AnimationPath::builtin("CREST58"), GAME->interface()->playerID.getNum(), 0, 606, 8);
++	banner = std::make_shared<CAnimImage>(AnimationPath::builtin("CREST58"), graphics->shownColor(GAME->interface()->playerID).getNum(), 0, 606, 8);
+ 	name = std::make_shared<CLabel>(190, 38, EFonts::FONT_BIG, ETextAlignment::CENTER, Colors::YELLOW);
+ 	title = std::make_shared<CLabel>(190, 65, EFonts::FONT_MEDIUM, ETextAlignment::CENTER, Colors::WHITE);
+ 
+diff --git a/client/windows/CMessage.cpp b/client/windows/CMessage.cpp
+index e8b31e5..04114b4 100644
+--- a/client/windows/CMessage.cpp
++++ b/client/windows/CMessage.cpp
+@@ -334,7 +334,7 @@ void CMessage::drawBorder(PlayerColor playerColor, Canvas & to, int w, int h, in
+ {
+ 	if(playerColor.isSpectator())
+ 		playerColor = PlayerColor(1);
+-	auto & box = piecesOfBox.at(playerColor.getNum());
++	auto & box = piecesOfBox.at(graphics->shownColor(playerColor).getNum());
+ 
+ 	// Note: this code assumes that the corner dimensions are all the same.
+ 
+diff --git a/client/windows/ClaudeChatWindow.cpp b/client/windows/ClaudeChatWindow.cpp
+new file mode 100644
+index 0000000..33abf42
+--- /dev/null
++++ b/client/windows/ClaudeChatWindow.cpp
+@@ -0,0 +1,197 @@
++/*
++ * ClaudeChatWindow.cpp, H3 Mod local patch (not part of VCMI)
++ *
++ * License: GNU General Public License v2.0 or later
++ *
++ */
++#include "StdInc.h"
++#include "ClaudeChatWindow.h"
++
++#include "../CPlayerInterface.h"
++#include "../CServerHandler.h"
++#include "../ClaudeBridge.h"
++#include "../GameChatHandler.h"
++#include "../GameEngine.h"
++#include "../GameInstance.h"
++#include "../gui/Shortcut.h"
++#include "../gui/WindowHandler.h"
++#include "../render/Canvas.h"
++#include "../render/Colors.h"
++#include "../render/IFont.h"
++#include "../render/IRenderHandler.h"
++#include "../widgets/Buttons.h"
++#include "../widgets/CTextInput.h"
++#include "../widgets/GraphicalPrimitiveCanvas.h"
++#include "../widgets/Images.h"
++#include "../widgets/Slider.h"
++#include "../widgets/TextControls.h"
++
++namespace
++{
++ClaudeBridge & bridge()
++{
++	return GAME->server().getGameChat().getClaudeBridge();
++}
++
++/// {...} switches colour in VCMI text, so keep braces in messages literal
++std::string escapeBraces(std::string text)
++{
++	boost::algorithm::replace_all(text, "{", "｛");
++	boost::algorithm::replace_all(text, "}", "｝");
++	return text;
++}
++}
++
++ClaudeChatWindow::ClaudeChatWindow()
++	: CWindowObject(BORDERED)
++{
++	OBJECT_CONSTRUCTION;
++
++	pos.w = 520;
++	pos.h = 420;
++
++	background = std::make_shared<FilledTexturePlayerColored>(Rect(0, 0, pos.w, pos.h));
++	if(GAME->interface())
++		background->setPlayerColor(GAME->interface()->playerID);
++	title = std::make_shared<CLabel>(pos.w / 2, 22, FONT_BIG, ETextAlignment::CENTER, Colors::YELLOW, "Claude");
++	linkLabel = std::make_shared<CLabel>(pos.w / 2, 46, FONT_SMALL, ETextAlignment::CENTER, Colors::WHITE, "");
++
++	historyBackground = std::make_shared<TransparentFilledRectangle>(Rect(12, 60, 496, 300), ColorRGBA(0, 0, 0, 128), ColorRGBA(64, 80, 128, 255), 1);
++	history = std::make_shared<CTextBox>("", Rect(16, 64, 488, 292), 1, FONT_MEDIUM);
++
++	inputBackground = std::make_shared<TransparentFilledRectangle>(Rect(12, 374, 344, 32), ColorRGBA(0, 0, 0, 192), ColorRGBA(64, 80, 128, 255), 1);
++	input = std::make_shared<CTextInput>(Rect(18, 374, 334, 32), FONT_MEDIUM, ETextAlignment::CENTERLEFT, true);
++
++	sendButton = std::make_shared<CButton>(Point(366, 375), AnimationPath::builtin("IOKAY"), CButton::tooltip("发送", "把这句话发给 Claude"), [this]() { send(); }, EShortcut::GLOBAL_ACCEPT);
++	closeButton = std::make_shared<CButton>(Point(440, 375), AnimationPath::builtin("ICANCEL"), CButton::tooltip("关闭"), [this]() { close(); }, EShortcut::GLOBAL_CANCEL);
++
++	addUsedEvents(TIME);
++	center();
++
++	bridge().markRead();
++	bridge().setListener([this]()
++	{
++		bridge().markRead();
++		refreshHistory();
++	});
++	refreshHistory();
++	refreshLink();
++}
++
++ClaudeChatWindow::~ClaudeChatWindow()
++{
++	bridge().setListener(nullptr);
++}
++
++void ClaudeChatWindow::send()
++{
++	const std::string text = boost::algorithm::trim_copy(input->getText());
++	input->setText("");
++	if(!text.empty())
++		bridge().sendFromWindow(text); // calls the listener, which refreshes the history
++}
++
++void ClaudeChatWindow::refreshHistory()
++{
++	std::string text;
++	for(const auto & message : bridge().getHistory())
++	{
++		const std::string sender = message.fromPlayer ? message.sender : "{" + escapeBraces(message.sender) + "}";
++		text += sender + "  " + message.time + "\n" + escapeBraces(message.text) + "\n\n";
++	}
++	if(text.empty())
++		text = "还没有消息。在下面打字，按回车或 √ 发给 Claude。\n\nClaude 的回复会出现在这里；关着这个窗口时，左下角的宝石上会标出有几条新消息。";
++	history->setText(text);
++	if(history->slider)
++		history->slider->scrollToMax();
++	redraw();
++}
++
++void ClaudeChatWindow::refreshLink()
++{
++	std::string description = bridge().getLinkDescription();
++	if(bridge().getLink() == ClaudeBridge::ELink::FILES)
++		description = "本机直连 Claude";
++	if(linkLabel->getText() != description)
++	{
++		linkLabel->setText(description);
++		linkLabel->setColor(bridge().getLink() == ClaudeBridge::ELink::OFFLINE ? Colors::ORANGE : Colors::WHITE);
++		redraw();
++	}
++}
++
++void ClaudeChatWindow::tick(uint32_t msPassed)
++{
++	sinceLinkCheck += msPassed;
++	if(sinceLinkCheck >= 1000)
++	{
++		sinceLinkCheck = 0;
++		refreshLink();
++	}
++}
++
++namespace
++{
++// The bottom-left gem looks just like the other three corner gems, so a tag next to it says
++// that it opens the Claude window. The gem ball sits at the left of the 46x46 gem area.
++constexpr int TAG_LEFT = 26;
++constexpr int GEM_CENTER_Y = 21;
++constexpr int TAG_PADDING = 6;
++
++std::string tagText(int unread)
++{
++	return unread <= 0 ? "Claude" : "Claude " + (unread > 9 ? std::string("9+") : std::to_string(unread));
++}
++}
++
++ClaudeChatButton::ClaudeChatButton(const Rect & area)
++	: CIntObject(LCLICK | HOVER | TIME)
++{
++	pos = area + pos.topLeft();
++	// clicks on the tag open the window too; "Claude 9+" is as wide as it gets
++	const auto & font = ENGINE->renderHandler().loadFont(FONT_SMALL);
++	pos.w = std::max(pos.w, TAG_LEFT + static_cast<int>(font->getStringWidth(tagText(10))) + 2 * TAG_PADDING);
++}
++
++void ClaudeChatButton::clickPressed(const Point & cursorPosition)
++{
++	if(!ENGINE->windows().topWindow<ClaudeChatWindow>())
++		ENGINE->windows().createAndPushWindow<ClaudeChatWindow>();
++}
++
++void ClaudeChatButton::hover(bool on)
++{
++	const int unread = bridge().getUnreadCount();
++	const std::string text = unread > 0 ? "Claude：" + std::to_string(unread) + " 条新消息，点开看" : "Claude：点开和 Claude 聊天";
++	if(on)
++		ENGINE->statusbar()->write(text);
++	else
++		ENGINE->statusbar()->clearIfMatching(text);
++}
++
++void ClaudeChatButton::tick(uint32_t msPassed)
++{
++	time += msPassed;
++}
++
++void ClaudeChatButton::showAll(Canvas & to)
++{
++	show(to);
++}
++
++void ClaudeChatButton::show(Canvas & to)
++{
++	// always there, so she can find the way in; red and blinking once a second while messages wait
++	const int unread = bridge().getUnreadCount();
++	const std::string text = tagText(unread);
++	const auto & font = ENGINE->renderHandler().loadFont(FONT_SMALL);
++	const int height = static_cast<int>(font->getLineHeight()) + 4;
++	const Rect tag(pos.x + TAG_LEFT, pos.y + GEM_CENTER_Y - height / 2, static_cast<int>(font->getStringWidth(text)) + 2 * TAG_PADDING, height);
++	const bool bright = (time / 500) % 2 == 0;
++	ColorRGBA fill(48, 32, 16, 255); // dark brown, like the frame
++	if(unread > 0)
++		fill = bright ? ColorRGBA(200, 30, 30, 255) : ColorRGBA(120, 20, 20, 255);
++	to.drawColor(tag, fill);
++	to.drawBorder(tag, Colors::YELLOW);
++	to.drawText(tag.center(), FONT_SMALL, unread > 0 ? Colors::WHITE : Colors::YELLOW, ETextAlignment::CENTER, text);
++}
+diff --git a/client/windows/ClaudeChatWindow.h b/client/windows/ClaudeChatWindow.h
+new file mode 100644
+index 0000000..04f4060
+--- /dev/null
++++ b/client/windows/ClaudeChatWindow.h
+@@ -0,0 +1,57 @@
++/*
++ * ClaudeChatWindow.h, H3 Mod local patch (not part of VCMI)
++ *
++ * License: GNU General Public License v2.0 or later
++ *
++ */
++#pragma once
++
++#include "CWindowObject.h"
++
++class CButton;
++class CLabel;
++class CTextBox;
++class CTextInput;
++class FilledTexturePlayerColored;
++class TransparentFilledRectangle;
++
++/// The Claude window: conversation with Claude (see ClaudeBridge) and a line to write in
++class ClaudeChatWindow : public CWindowObject
++{
++	std::shared_ptr<FilledTexturePlayerColored> background;
++	std::shared_ptr<CLabel> title;
++	std::shared_ptr<CLabel> linkLabel;
++	std::shared_ptr<TransparentFilledRectangle> historyBackground;
++	std::shared_ptr<CTextBox> history;
++	std::shared_ptr<TransparentFilledRectangle> inputBackground;
++	std::shared_ptr<CTextInput> input;
++	std::shared_ptr<CButton> sendButton;
++	std::shared_ptr<CButton> closeButton;
++	uint32_t sinceLinkCheck = 0;
++
++	void send();
++	void refreshHistory();
++	void refreshLink();
++
++public:
++	ClaudeChatWindow();
++	~ClaudeChatWindow();
++
++	void tick(uint32_t msPassed) override;
++};
++
++/// Click target over the adventure map's bottom-left gem: opens the Claude window and shows
++/// how many of Claude's lines are unread
++class ClaudeChatButton : public CIntObject
++{
++	uint32_t time = 0;
++
++public:
++	explicit ClaudeChatButton(const Rect & area);
++
++	void clickPressed(const Point & cursorPosition) override;
++	void hover(bool on) override;
++	void tick(uint32_t msPassed) override;
++	void showAll(Canvas & to) override;
++	void show(Canvas & to) override;
++};
+diff --git a/client/windows/GUIClasses.cpp b/client/windows/GUIClasses.cpp
+index b212c3b..0ca275b 100644
+--- a/client/windows/GUIClasses.cpp
++++ b/client/windows/GUIClasses.cpp
+@@ -9,6 +9,7 @@
+  */
+ #include "StdInc.h"
+ #include "GUIClasses.h"
++#include "../render/Graphics.h"
+ 
+ #include "CCastleInterface.h"
+ #include "CCreatureWindow.h"
+@@ -1260,7 +1261,7 @@ CGarrisonWindow::CGarrisonWindow(const CArmedInstance * up, const CGHeroInstance
+ 	if(sourceTown != nullptr && down->getVisitedTown() != sourceTown && sourceHero != nullptr)
+ 		banner = std::make_shared<CAnimImage>(AnimationPath::builtin("PortraitsLarge"), sourceHero->getIconIndex(), 0, 27, 127);
+ 	else
+-		banner = std::make_shared<CAnimImage>(AnimationPath::builtin("CREST58"), up->getOwner().getNum(), 0, 27, 127);
++		banner = std::make_shared<CAnimImage>(AnimationPath::builtin("CREST58"), graphics->shownColor(up->getOwner()).getNum(), 0, 27, 127);
+ 
+ 	portrait = std::make_shared<CAnimImage>(AnimationPath::builtin("PortraitsLarge"), down->getIconIndex(), 0, 27, 223);
+ }
+@@ -1605,7 +1606,7 @@ CThievesGuildWindow::CThievesGuildWindow(const CGObjectInstance * _owner):
+ 	int counter = 0;
+ 	for(auto & iter : tgi.colorToBestHero)
+ 	{
+-		banners.push_back(std::make_shared<CPicture>(ImagePath::builtin(colorToBox[iter.first.getNum()]), 253 + 66 * counter, 334));
++		banners.push_back(std::make_shared<CPicture>(ImagePath::builtin(colorToBox[graphics->shownColor(iter.first).getNum()]), 253 + 66 * counter, 334));
+ 		if(iter.second.portraitSource.isValid())
+ 		{
+ 			bestHeroes.push_back(std::make_shared<CAnimImage>(AnimationPath::builtin("PortraitsSmall"), iter.second.getIconIndex(), 0, 260 + 66 * counter, 360));
+diff --git a/clientapp/EntryPoint.cpp b/clientapp/EntryPoint.cpp
+index 6adc6de..78406b4 100644
+--- a/clientapp/EntryPoint.cpp
++++ b/clientapp/EntryPoint.cpp
+@@ -143,6 +143,9 @@ int main(int argc, char * argv[])
+ 		("version,v", "display version information and exit")
+ 		("testmap", po::value<std::string>(), "")
+ 		("testsave", po::value<std::string>(), "")
++		("testmap-human", "with --testmap or --testsave: keep the first colour for a human player instead of making every colour AI")
++		("testmap-claude", po::value<std::string>(), "with --testmap or --testsave: give these AI colours to Claude (comma separated, e.g. blue), as the lobby's 颜色和 Claude window does")
++		("testmap-hotseat", po::value<std::string>(), "with --testmap or --testsave: more hotseat players after the first, comma separated (\"Claude\" is played by Claude); implies --testmap-human")
+ 		("logLocation", po::value<std::string>(), "new location for log files")
+ 		("spectate,s", "enable spectator interface for AI-only games")
+ 		("spectate-ignore-hero", "wont follow heroes on adventure map")
+@@ -252,6 +255,7 @@ int main(int argc, char * argv[])
+ 	};
+ 
+ 	setSettingBool("session/onlyai", "onlyAI");
++	setSettingBool("session/testmap-human", "testmap-human");
+ 	setSettingBool("session/disableVideo", "disable-video");
+ 	if(vm.count("headless"))
+ 	{
+@@ -355,13 +359,19 @@ int main(int argc, char * argv[])
+ 		if(vm.count("testmap"))
+ 		{
+ 			session["testmap"].String() = vm["testmap"].as<std::string>();
+-			session["onlyai"].Bool() = true;
++			session["testmap-hotseat"].String() = vm.count("testmap-hotseat") ? vm["testmap-hotseat"].as<std::string>() : "";
++			session["testmap-claude"].String() = vm.count("testmap-claude") ? vm["testmap-claude"].as<std::string>() : "";
++			session["testmap-human"].Bool() = vm.count("testmap-human") || vm.count("testmap-hotseat");
++			session["onlyai"].Bool() = !session["testmap-human"].Bool();
+ 			GAME->server().debugStartTest(session["testmap"].String(), false);
+ 		}
+ 		else if(vm.count("testsave"))
+ 		{
+ 			session["testsave"].String() = vm["testsave"].as<std::string>();
+-			session["onlyai"].Bool() = true;
++			session["testmap-hotseat"].String() = vm.count("testmap-hotseat") ? vm["testmap-hotseat"].as<std::string>() : "";
++			session["testmap-claude"].String() = vm.count("testmap-claude") ? vm["testmap-claude"].as<std::string>() : "";
++			session["testmap-human"].Bool() = vm.count("testmap-human") || vm.count("testmap-hotseat");
++			session["onlyai"].Bool() = !session["testmap-human"].Bool();
+ 			GAME->server().debugStartTest(session["testsave"].String(), true);
+ 		}
+ 		else if (!settings["session"]["headless"].Bool())
+diff --git a/clientapp/ios/Info.plist b/clientapp/ios/Info.plist
+index 32d1f67..58d1150 100644
+--- a/clientapp/ios/Info.plist
++++ b/clientapp/ios/Info.plist
+@@ -33,6 +33,8 @@
+ 	<true/>
+ 	<key>LSSupportsOpeningDocumentsInPlace</key>
+ 	<true/>
++	<key>NSLocalNetworkUsageDescription</key>
++	<string>和电脑上的回声中转站聊天、上传自动存档（H3 Mod）</string>
+ 	<key>NSAppTransportSecurity</key>
+ 	<dict>
+ 		<key>NSAllowsArbitraryLoads</key>
+diff --git a/config/widgets/adventureMap.json b/config/widgets/adventureMap.json
+index d04352b..d277fd0 100644
+--- a/config/widgets/adventureMap.json
++++ b/config/widgets/adventureMap.json
+@@ -890,6 +890,11 @@
+ 					"index" : 0,
+ 					"perPlayer" : 1,
+ 					"area" : { "left": 0, "top" : 0, "right" : 0, "bottom" : 0 }
++				},
++				{
++					"type": "claudeChatButton",
++					"name" : "claudeChat",
++					"area" : { "left": 0, "top" : 0, "right" : 0, "bottom" : 0 }
+ 				}
+ 			]
+ 		},
+diff --git a/config/widgets/adventureMapPortrait.json b/config/widgets/adventureMapPortrait.json
+index f315079..a3999b3 100644
+--- a/config/widgets/adventureMapPortrait.json
++++ b/config/widgets/adventureMapPortrait.json
+@@ -822,6 +822,11 @@
+ 					"index" : 0,
+ 					"perPlayer" : 1,
+ 					"area" : { "left": 0, "top" : 0, "right" : 0, "bottom" : 0 }
++				},
++				{
++					"type": "claudeChatButton",
++					"name" : "claudeChat",
++					"area" : { "left": 0, "top" : 0, "right" : 0, "bottom" : 0 }
+ 				}
+ 			]
+ 		},
+diff --git a/lib/texts/TextLocalizationContainer.cpp b/lib/texts/TextLocalizationContainer.cpp
+index 5d69e83..0e5a9a9 100644
+--- a/lib/texts/TextLocalizationContainer.cpp
++++ b/lib/texts/TextLocalizationContainer.cpp
+@@ -71,15 +71,58 @@ void TextLocalizationContainer::removeSubContainer(const TextLocalizationContain
+ 	subContainers.erase(std::remove(subContainers.begin(), subContainers.end(), &container), subContainers.end());
+ }
+ 
++std::array<int, 8> TextLocalizationContainer::shownPlayerColors = {0, 1, 2, 3, 4, 5, 6, 7};
++
++void TextLocalizationContainer::setShownPlayerColors(const std::array<int, 8> & shown)
++{
++	std::lock_guard globalLock(globalTextMutex);
++	shownPlayerColors = shown;
++}
++
+ const std::string & TextLocalizationContainer::translateString(const TextIdentifier & identifier) const
+ {
+ 	std::lock_guard globalLock(globalTextMutex);
+ 
++	// H3 Mod local patch: a player colour shown as another colour is also called by that colour's name.
++	// Texts with one entry per colour: the names, and "owned by the red player" ... (arraytxt 23-30)
++	struct ColorTexts
++	{
++		const char * prefix;
++		int first;
++	};
++	static const ColorTexts colorTexts[] = {{"vcmi.capitalColors.", 0}, {"core.plcolors.", 0}, {"core.arraytxt.", 23}};
++	const std::string & id = identifier.get();
++	if(id.size() > 14 && (id[0] == 'v' || id[0] == 'c') && id.back() >= '0' && id.back() <= '9')
++	{
++		for(const auto & texts : colorTexts)
++		{
++			const size_t length = std::strlen(texts.prefix);
++			if(id.compare(0, length, texts.prefix) != 0 || id.size() > length + 2)
++				continue;
++			const std::string suffix = id.substr(length);
++			if(!std::all_of(suffix.begin(), suffix.end(), [](char c) { return c >= '0' && c <= '9'; }))
++				break;
++			const int index = std::stoi(suffix) - texts.first;
++			if(index < 0 || index >= 8 || shownPlayerColors[index] == index)
++				break;
++			const TextIdentifier swapped(std::string(texts.prefix) + std::to_string(texts.first + shownPlayerColors[index]));
++			if(identifierExists(swapped))
++				return translateStringUnswapped(swapped);
++			break;
++		}
++	}
++	return translateStringUnswapped(identifier);
++}
++
++const std::string & TextLocalizationContainer::translateStringUnswapped(const TextIdentifier & identifier) const
++{
++	std::lock_guard globalLock(globalTextMutex);
++
+ 	if(stringsLocalizations.count(identifier.get()) == 0)
+ 	{
+ 		for(auto containerIter = subContainers.rbegin(); containerIter != subContainers.rend(); ++containerIter)
+ 			if((*containerIter)->identifierExists(identifier))
+-				return (*containerIter)->translateString(identifier);
++				return (*containerIter)->translateStringUnswapped(identifier);
+ 
+ 		logGlobal->error("Unable to find localization for string '%s'", identifier.get());
+ 		return identifier.get();
+diff --git a/lib/texts/TextLocalizationContainer.h b/lib/texts/TextLocalizationContainer.h
+index ebbb87b..25d0645 100644
+--- a/lib/texts/TextLocalizationContainer.h
++++ b/lib/texts/TextLocalizationContainer.h
+@@ -65,6 +65,10 @@ protected:
+ 	// returns true if identifier with such name was registered, even if not translated to current language
+ 	bool identifierExists(const TextIdentifier & UID) const;
+ 
++	/// H3 Mod local patch: player colour names follow the colours the client shows (client/render/Graphics, setShownColors)
++	static std::array<int, 8> shownPlayerColors;
++	const std::string & translateStringUnswapped(const TextIdentifier & identifier) const;
++
+ public:
+ 	/// Loads translation from provided json
+ 	/// Any entries loaded by this will have priority over texts registered normally
+@@ -86,6 +90,10 @@ public:
+ 	/// converts identifier into user-readable string
+ 	const std::string & translateString(const TextIdentifier & identifier) const;
+ 
++	/// H3 Mod local patch: shown[i] is the colour whose name stands in for player colour i
++	/// ("vcmi.capitalColors.i" and "core.plcolors.i"); identity by default. Display only, nothing is saved
++	static void setShownPlayerColors(const std::array<int, 8> & shown);
++
+ 	/// Debug method, returns all currently stored texts
+ 	/// Format: [mod ID][string ID] -> human-readable text
+ 	void exportAllTexts(std::map<std::string, ExportedStrings> & storage, bool onlyMissing) const;
+diff --git a/server/CVCMIServer.cpp b/server/CVCMIServer.cpp
+index 682709c..eddc7fa 100644
+--- a/server/CVCMIServer.cpp
++++ b/server/CVCMIServer.cpp
+@@ -577,11 +577,18 @@ void CVCMIServer::clientDisconnected(std::shared_ptr<GameConnection> connection)
+ 	}
+ }
+ 
++// H3 Mod local patch: a seat named like this is played by Claude (client/ClaudePlayer.h), also when it is an AI seat
++static bool isClaudeSeatName(std::string name)
++{
++	boost::algorithm::trim(name);
++	return boost::algorithm::istarts_with(name, "claude") || name == "回声";
++}
++
+ void CVCMIServer::setPlayerConnectedId(PlayerSettings & pset, PlayerConnectionID player) const
+ {
+ 	if(vstd::contains(playerNames, player))
+ 		pset.name = playerNames.find(player)->second.name;
+-	else
++	else if(!isClaudeSeatName(pset.name)) // H3 Mod: an AI seat given to Claude keeps that, also in loaded saves
+ 		pset.name = LIBRARY->generaltexth->allTexts[468]; //Computer
+ 
+ 	logGlobal->debug("Player color %d will be controlled from connection %d", pset.color, static_cast<int>(player));
+@@ -756,6 +763,14 @@ void CVCMIServer::setPlayer(PlayerColor clickedColor)
+ 
+ 	setPlayerConnectedId(clicked, newPlayer); //put player
+ 
++	// H3 Mod local patch: a person may take a colour the map gives to the computer only; left alone, it is the computer's again
++	auto restoreComputerOnly = [this](PlayerColor color, PlayerSettings & seat)
++	{
++		if(mi && mi->mapHeader && color.isValidPlayer() && color.getNum() < static_cast<int>(mi->mapHeader->players.size()))
++			seat.compOnly = seat.isControlledByAI() && !mi->mapHeader->players[color.getNum()].canHumanPlay;
++	};
++	restoreComputerOnly(clickedColor, clicked);
++
+ 	//if that player was somewhere else, we need to replace him with computer
+ 	if(newPlayer != PlayerConnectionID::PLAYER_AI) //not AI
+ 	{
+@@ -768,6 +783,7 @@ void CVCMIServer::setPlayer(PlayerColor clickedColor)
+ 				playerToRestore.color = i->first;
+ 				playerToRestore.id = newPlayer;
+ 				setPlayerConnectedId(i->second, PlayerConnectionID::PLAYER_AI); //set computer
++				restoreComputerOnly(i->first, i->second);
+ 				break;
+ 			}
+ 		}
+@@ -782,7 +798,11 @@ void CVCMIServer::setPlayerName(PlayerColor color, const std::string & name)
+ 	PlayerSettings & player = si->playerInfos.at(color);
+ 
+ 	if(!player.isControlledByHuman())
++	{
++		// H3 Mod local patch: the lobby can give an AI seat to Claude ("Claude") or back to the computer ("")
++		player.name = isClaudeSeatName(name) ? name : LIBRARY->generaltexth->allTexts[468];
+ 		return;
++	}
+ 
+ 	if(player.connectedPlayerIDs.empty())
+ 		return;
+diff --git a/server/processors/PlayerMessageProcessor.cpp b/server/processors/PlayerMessageProcessor.cpp
+index 903eb7c..5a9441e 100644
+--- a/server/processors/PlayerMessageProcessor.cpp
++++ b/server/processors/PlayerMessageProcessor.cpp
+@@ -18,6 +18,8 @@
+ 
+ #include "../../lib/CPlayerState.h"
+ #include "../../lib/CSkillHandler.h"
++#include "../../lib/CCreatureHandler.h"
++#include "../../lib/constants/StringConstants.h"
+ #include "../../lib/StartInfo.h"
+ #include "../../lib/IGameSettings.h"
+ #include "../../lib/constants/Enumerations.h"
+@@ -46,6 +48,9 @@ PlayerMessageProcessor::PlayerMessageProcessor(CGameHandler * gameHandler)
+ 
+ void PlayerMessageProcessor::playerMessage(PlayerColor player, const std::string & message, ObjectInstanceID currObj)
+ {
++	if(handleHostCommand(player, message, currObj)) // H3 Mod local patch: Claude's 主持人命令, see below
++		return;
++
+ 	if(!message.empty() && message[0] == '!')
+ 	{
+ 		broadcastMessage(player, message);
+@@ -992,3 +997,422 @@ void PlayerMessageProcessor::broadcastMessage(PlayerColor playerSender, const st
+ 	PlayerMessageClient temp_message(playerSender, message);
+ 	gameHandler->sendAndApply(temp_message);
+ }
++
++// ---- H3 Mod local patch: 主持人命令 (host commands) ----
++//
++// Claude ("回声") changes the running game through the client's ClaudeBridge: Claude writes a
++// line of kind "gm" to claude-bridge/to-game.jsonl, and the client sends it on as the chat
++// message "#host <key> <command>". The key is in <user data>/claude-bridge/host-key.txt, so only
++// a client on the machine that runs this server can use it. The edits are the ones
++// tools/vcmi_src/save_edit.cpp makes to saves, through the same CGameHandler calls as the cheat
++// codes, but without PlayerCheated: nobody is marked as a cheater. Each result goes back as a
++// system message starting with 【Claude】, which the client also forwards to Claude.
++//
++//   [hero=<name|id>] [town=<name|id>] [player=<colour>] then one of
++//   give <creature> <count> | resource <name> <n|+n|-n> | artifact <artifact> [slot]
++//   exp <n> | levels <n> | primary <attack|defence|spellpower|knowledge> <n|+n|-n>
++//   skill <skill> <0-3> | spell <spell> | mana <n|+n|-n> | move [points]
++//   build <building> | raze <building>
++//   army <slot 1-7> <creature> <count> | army <slot 1-7> none   (town= without hero=: the garrison)
++//   recruits [level 1-7] <n|+n|-n>    creatures waiting in the town's dwellings
++//   reveal | hide | puzzle            map, obelisk puzzle (like the cheats, minus the cheater mark)
++//   luck | morale | fly               permanent max luck / max morale / flying for the hero
++//   teleport <x> <y> [z]              standing tile, as tools/vcmi_save.py prints it
++// Names: VCMI identifiers (goldDragon, capitol) or the in-game names (金龙, 国会).
++// The extra commands are the ones the original game's trainers and cheat codes offer most.
++namespace
++{
++const std::string HOST_PREFIX = "#host ";
++
++std::string readHostKey()
++{
++	boost::filesystem::path dir = VCMIDirs::get().userDataPath() / "claude-bridge"; // as ClaudeBridge::directory()
++	if(const char * custom = std::getenv("VCMI_CLAUDE_BRIDGE"))
++		dir = custom;
++	std::ifstream in((dir / "host-key.txt").c_str());
++	std::string key;
++	in >> key;
++	return key;
++}
++
++/// "+5" / "-5" add, "5" sets
++int64_t applyAmount(const std::string & text, int64_t current)
++{
++	const int64_t value = std::stoll(text);
++	return !text.empty() && (text[0] == '+' || text[0] == '-') ? current + value : value;
++}
++
++/// VCMI identifier (case-insensitive, any mod scope) or the translated in-game name
++template<typename Objects, typename NameFn>
++int32_t resolveEntity(const std::string & type, const std::string & text, const Objects & objects, NameFn names)
++{
++	if(auto id = LIBRARY->identifiers()->getIdentifierCaseInsensitive(ModScope::scopeGame(), type, text, true))
++		return *id;
++	for(const auto & object : objects)
++		if(object)
++			for(const auto & name : names(*object))
++				if(name == text)
++					return object->getIndex();
++	throw std::runtime_error("不认识的 " + type + "：" + text);
++}
++
++const std::string & argument(const std::vector<std::string> & words, size_t i, const std::string & what)
++{
++	if(i >= words.size())
++		throw std::runtime_error("少了参数：" + what);
++	return words[i];
++}
++}
++
++bool PlayerMessageProcessor::handleHostCommand(PlayerColor player, const std::string & message, ObjectInstanceID currObj)
++{
++	if(!boost::starts_with(message, HOST_PREFIX))
++		return false;
++
++	std::vector<std::string> words;
++	boost::split(words, boost::trim_copy(message.substr(HOST_PREFIX.size())), boost::is_any_of("\t\r\n "), boost::token_compress_on);
++	const std::string key = readHostKey();
++	if(key.empty() || words.empty() || words[0] != key)
++	{
++		logGlobal->warn("Host command with a wrong key from %s", player.toString());
++		return true; // never broadcast it: that would show the attempt to everyone
++	}
++	words.erase(words.begin());
++
++	auto & gs = gameHandler->gameState();
++	try
++	{
++		const CGHeroInstance * hero = nullptr;
++		const CGTownInstance * town = nullptr;
++		std::optional<PlayerColor> target;
++		std::vector<std::string> command;
++		for(const auto & w : words)
++		{
++			const auto eq = w.find('=');
++			const std::string name = eq == std::string::npos ? "" : w.substr(0, eq);
++			const std::string value = eq == std::string::npos ? "" : w.substr(eq + 1);
++			if(name == "hero" || name == "town")
++			{
++				for(const auto & entry : gs.players)
++				{
++					if(name == "hero")
++						for(const auto * h : entry.second.getHeroes())
++							if(std::to_string(h->id.getNum()) == value || h->getNameTranslated() == value)
++								hero = h;
++					if(name == "town")
++						for(const auto * t : entry.second.getTowns())
++							if(std::to_string(t->id.getNum()) == value || t->getNameTranslated() == value)
++								town = t;
++				}
++				if((name == "hero" && !hero) || (name == "town" && !town))
++					throw std::runtime_error(std::string(name == "hero" ? "找不到英雄：" : "找不到城镇：") + value);
++			}
++			else if(name == "player")
++			{
++				for(const auto & entry : gs.players)
++					if(entry.first.toString() == value)
++						target = entry.first;
++				if(!target)
++					throw std::runtime_error("没有这个颜色的玩家：" + value);
++			}
++			else
++				command.push_back(w);
++		}
++		if(command.empty())
++			throw std::runtime_error("没有命令");
++
++		const PlayerColor owner = target ? *target : hero ? hero->getOwner() : town ? town->getOwner() : player;
++		const auto & ownerState = gs.players.at(owner);
++		const auto * selectedHero = gameHandler->gameInfo().getHero(currObj);
++		const auto * selectedTown = gameHandler->gameInfo().getTown(currObj);
++		auto currentHero = [&]() -> const CGHeroInstance *
++		{
++			if(hero)
++				return hero;
++			if(selectedHero && selectedHero->getOwner() == owner)
++				return selectedHero;
++			if(ownerState.getHeroes().empty())
++				throw std::runtime_error("这个玩家没有英雄");
++			return ownerState.getHeroes().front();
++		};
++		auto currentTown = [&]() -> const CGTownInstance *
++		{
++			if(town)
++				return town;
++			if(selectedTown && selectedTown->getOwner() == owner)
++				return selectedTown;
++			if(selectedHero && selectedHero->getOwner() == owner && selectedHero->getVisitedTown())
++				return selectedHero->getVisitedTown();
++			if(ownerState.getTowns().empty())
++				throw std::runtime_error("这个玩家没有城镇");
++			return ownerState.getTowns().front();
++		};
++
++		const std::string verb = boost::to_lower_copy(command[0]);
++		std::string done;
++		if(verb == "give")
++		{
++			const auto * h = currentHero();
++			const std::string & name = argument(command, 1, "兵种");
++			const CreatureID creature(resolveEntity("creature", name, LIBRARY->creh->objects, [](const CCreature & c)
++				{ return std::vector<std::string>{c.getNameSingularTranslated(), c.getNamePluralTranslated()}; }));
++			const int count = std::stoi(argument(command, 2, "数量"));
++			const SlotID slot = h->getSlotFor(creature);
++			if(!slot.validSlot())
++				throw std::runtime_error(h->getNameTranslated() + " 的部队没有空位放 " + name);
++			if(h->hasStackAtSlot(slot))
++				gameHandler->changeStackCount(StackLocation(h->id, slot), count, ChangeValueMode::RELATIVE);
++			else
++				gameHandler->insertNewStack(StackLocation(h->id, slot), creature.toCreature(), count);
++			done = h->getNameTranslated() + " 得到 " + creature.toCreature()->getNamePluralTranslated() + "×" + std::to_string(count)
++				+ "（现在 " + std::to_string(h->getStackCount(slot)) + "）";
++		}
++		else if(verb == "resource")
++		{
++			const std::string & name = argument(command, 1, "资源");
++			std::optional<GameResID> res;
++			for(int r = 0; r < GameResID::COUNT; ++r)
++				if(GameResID::encode(r) == name)
++					res = GameResID(r);
++			if(!res)
++				throw std::runtime_error("不认识的资源：" + name + "（gold wood ore mercury sulfur crystal gems）");
++			const int64_t before = ownerState.resources[*res];
++			ResourceSet delta;
++			delta[*res] = static_cast<TResource>(applyAmount(argument(command, 2, "数量"), before) - before);
++			gameHandler->giveResources(owner, delta);
++			done = owner.toString() + " " + name + " " + std::to_string(before) + " → " + std::to_string(gs.players.at(owner).resources[*res]);
++		}
++		else if(verb == "artifact")
++		{
++			const auto * h = currentHero();
++			const ArtifactID art(resolveEntity("artifact", argument(command, 1, "宝物"), LIBRARY->arth->objects, [](const CArtifact & a)
++				{ return std::vector<std::string>{a.getNameTranslated()}; }));
++			ArtifactPosition pos = ArtifactPosition::FIRST_AVAILABLE;
++			if(command.size() > 2)
++			{
++				pos = ArtifactPosition::PRE_FIRST;
++				if(command[2] == "backpack")
++					pos = ArtifactPosition::BACKPACK_START;
++				for(size_t i = 0; i < NArtifactPosition::namesHero.size(); ++i)
++					if(command[2] == NArtifactPosition::namesHero[i])
++						pos = ArtifactPosition(static_cast<int32_t>(i));
++				if(pos == ArtifactPosition::PRE_FIRST)
++					throw std::runtime_error("不认识的宝物栏：" + command[2]);
++			}
++			if(!gameHandler->giveHeroNewArtifact(h, art, pos))
++				throw std::runtime_error(art.toArtifact()->getNameTranslated() + " 放不到 " + h->getNameTranslated() + " 身上");
++			done = h->getNameTranslated() + " 得到 " + art.toArtifact()->getNameTranslated();
++		}
++		else if(verb == "exp" || verb == "levels")
++		{
++			const auto * h = currentHero();
++			const int64_t n = std::stoll(argument(command, 1, "数量"));
++			const int64_t amount = verb == "exp" ? n : LIBRARY->heroh->reqExp(h->level + n) - h->exp;
++			gameHandler->giveExperience(h, amount); // level-ups ask the player as usual
++			done = h->getNameTranslated() + " 经验 +" + std::to_string(amount);
++		}
++		else if(verb == "primary")
++		{
++			const auto * h = currentHero();
++			const std::string & name = argument(command, 1, "主属性");
++			std::optional<PrimarySkill> skill;
++			for(const auto & s : PrimarySkill::ALL_SKILLS())
++				if(PrimarySkill::encode(s.getNum()) == name)
++					skill = s;
++			if(name == "defense")
++				skill = PrimarySkill::DEFENSE;
++			if(!skill)
++				throw std::runtime_error("不认识的主属性：" + name + "（attack defence spellpower knowledge）");
++			const int before = h->getBasePrimarySkillValue(*skill);
++			gameHandler->changePrimSkill(h, *skill, applyAmount(argument(command, 2, "数值"), before), ChangeValueMode::ABSOLUTE);
++			done = h->getNameTranslated() + " " + name + " " + std::to_string(before) + " → " + std::to_string(h->getBasePrimarySkillValue(*skill));
++		}
++		else if(verb == "skill")
++		{
++			const auto * h = currentHero();
++			const SecondarySkill skill(resolveEntity("secondarySkill", argument(command, 1, "技能"), LIBRARY->skillh->objects, [](const CSkill & s)
++				{ return std::vector<std::string>{s.getNameTranslated()}; }));
++			gameHandler->changeSecSkill(h, skill, std::stoi(argument(command, 2, "等级 0-3")), ChangeValueMode::ABSOLUTE);
++			done = h->getNameTranslated() + " " + skill.toEntity(LIBRARY)->getNameTranslated() + " → " + std::to_string(h->getSecSkillLevel(skill)) + " 级";
++		}
++		else if(verb == "spell")
++		{
++			const auto * h = currentHero();
++			const SpellID spell(resolveEntity("spell", argument(command, 1, "法术"), LIBRARY->spellh->objects, [](const CSpell & s)
++				{ return std::vector<std::string>{s.getNameTranslated()}; }));
++			if(!h->hasSpellbook())
++				gameHandler->giveHeroNewArtifact(h, ArtifactID::SPELLBOOK, ArtifactPosition::SPELLBOOK);
++			gameHandler->changeSpells(h, true, {spell});
++			done = h->getNameTranslated() + " 学会 " + spell.toEntity(LIBRARY)->getNameTranslated();
++		}
++		else if(verb == "mana")
++		{
++			const auto * h = currentHero();
++			const int before = h->mana;
++			SetMana pack(h->id, static_cast<si32>(applyAmount(argument(command, 1, "数值"), before)), ChangeValueMode::ABSOLUTE);
++			gameHandler->sendAndApply(pack);
++			done = h->getNameTranslated() + " 魔法 " + std::to_string(before) + " → " + std::to_string(h->mana);
++		}
++		else if(verb == "move")
++		{
++			const auto * h = currentHero();
++			SetMovePoints pack;
++			pack.hid = h->id;
++			pack.val = command.size() > 1 ? std::stoi(command[1]) : h->movementPointsRemaining() + 2000;
++			gameHandler->sendAndApply(pack);
++			done = h->getNameTranslated() + " 行动力 → " + std::to_string(h->movementPointsRemaining());
++		}
++		else if(verb == "build" || verb == "raze")
++		{
++			const auto * t = currentTown();
++			const std::string & name = argument(command, 1, "建筑");
++			std::optional<BuildingID> bid;
++			for(const auto & entry : t->getTown()->buildings)
++				if(entry.second && (boost::iequals(entry.second->getJsonKey(), name) || boost::iends_with(entry.second->getJsonKey(), ":" + name) || entry.second->getNameTranslated() == name))
++					bid = entry.first;
++			if(!bid)
++				throw std::runtime_error(t->getNameTranslated() + " 没有这种建筑：" + name);
++			const std::string label = t->getTown()->buildings.at(*bid)->getNameTranslated();
++			if(verb == "build")
++			{
++				if(t->hasBuilt(*bid))
++					throw std::runtime_error(t->getNameTranslated() + " 已经有 " + label);
++				gameHandler->buildStructure(t->id, *bid, true); // force: no cost, no requirements
++			}
++			else
++			{
++				if(!t->hasBuilt(*bid))
++					throw std::runtime_error(t->getNameTranslated() + " 没有 " + label);
++				gameHandler->razeStructure(t->id, *bid);
++			}
++			done = t->getNameTranslated() + (verb == "build" ? " 盖好 " : " 拆掉 ") + label;
++		}
++		else if(verb == "army")
++		{
++			const CArmedInstance * army = town && !hero ? static_cast<const CArmedInstance *>(town) : currentHero();
++			const std::string label = town && !hero ? town->getNameTranslated() + " 的驻军" : currentHero()->getNameTranslated();
++			const int number = std::stoi(argument(command, 1, "第几格 1-7"));
++			if(number < 1 || number > GameConstants::ARMY_SIZE)
++				throw std::runtime_error("格子要在 1 到 7 之间");
++			const SlotID slot(number - 1);
++			const StackLocation location(army->id, slot);
++			const std::string & what = argument(command, 2, "兵种，或 none");
++			if(what == "none")
++			{
++				if(!army->hasStackAtSlot(slot))
++					throw std::runtime_error(label + " 第 " + std::to_string(number) + " 格本来就是空的");
++				if(!gameHandler->eraseStack(location))
++					throw std::runtime_error(label + " 只剩这一格兵，不能清空");
++				done = label + " 第 " + std::to_string(number) + " 格清空了";
++			}
++			else
++			{
++				const CreatureID creature(resolveEntity("creature", what, LIBRARY->creh->objects, [](const CCreature & c)
++					{ return std::vector<std::string>{c.getNameSingularTranslated(), c.getNamePluralTranslated()}; }));
++				const int count = std::stoi(argument(command, 3, "数量"));
++				if(count < 1)
++					throw std::runtime_error("数量至少 1；要清空这一格用 none");
++				if(!army->hasStackAtSlot(slot))
++					gameHandler->insertNewStack(location, creature.toCreature(), count);
++				else
++				{
++					if(army->getCreature(slot) != creature.toCreature())
++						gameHandler->changeStackType(location, creature.toCreature());
++					gameHandler->changeStackCount(location, count, ChangeValueMode::ABSOLUTE);
++				}
++				done = label + " 第 " + std::to_string(number) + " 格 → " + creature.toCreature()->getNamePluralTranslated() + "×" + std::to_string(count);
++			}
++		}
++		else if(verb == "recruits")
++		{
++			const auto * t = currentTown();
++			SetAvailableCreatures pack;
++			pack.tid = t->id;
++			pack.creatures = t->creatures;
++			size_t first = 0;
++			size_t last = pack.creatures.size();
++			std::string amount = argument(command, 1, "数量");
++			if(command.size() > 2)
++			{
++				const int level = std::stoi(command[1]);
++				if(level < 1 || level > static_cast<int>(pack.creatures.size()))
++					throw std::runtime_error("兵种等级要在 1 到 " + std::to_string(pack.creatures.size()) + " 之间");
++				first = level - 1;
++				last = level;
++				amount = command[2];
++			}
++			std::vector<std::string> parts;
++			for(size_t i = first; i < last; ++i)
++			{
++				auto & [available, creatures] = pack.creatures[i];
++				if(creatures.empty())
++					continue; // no dwelling built for this level
++				available = static_cast<ui32>(std::max<int64_t>(0, applyAmount(amount, available)));
++				parts.push_back(creatures.front().toCreature()->getNamePluralTranslated() + " " + std::to_string(available));
++			}
++			if(parts.empty())
++				throw std::runtime_error(t->getNameTranslated() + " 还没有这一级的兵营");
++			gameHandler->sendAndApply(pack);
++			done = t->getNameTranslated() + " 可招募：" + boost::algorithm::join(parts, "、");
++		}
++		else if(verb == "reveal" || verb == "hide")
++		{
++			cheatMapReveal(owner, verb == "reveal");
++			done = owner.toString() + (verb == "reveal" ? " 地图全开" : " 地图重新遮上了");
++		}
++		else if(verb == "puzzle")
++		{
++			// cheatPuzzleReveal without its PlayerCheated
++			const TeamState * team = gs.getPlayerTeam(owner);
++			int count = 0;
++			for(auto & obelisk : gs.getMap().getObjects<CGObelisk>())
++			{
++				if(obelisk->wasVisited(owner))
++					continue;
++				gameHandler->setObjPropertyID(obelisk->id, ObjProperty::OBELISK_VISITED, team->id);
++				for(const auto & color : team->players)
++					gameHandler->setObjPropertyID(obelisk->id, ObjProperty::VISITED, color);
++				count++;
++			}
++			done = owner.toString() + " 的拼图多揭开了 " + std::to_string(count) + " 座方尖碑";
++		}
++		else if(verb == "luck" || verb == "morale" || verb == "fly")
++		{
++			const auto * h = currentHero();
++			if(verb == "luck")
++				cheatMaxLuck(owner, h);
++			else if(verb == "morale")
++				cheatMaxMorale(owner, h);
++			else
++				cheatFly(owner, h);
++			done = h->getNameTranslated() + (verb == "luck" ? " 的运气从此最高" : verb == "morale" ? " 的士气从此最高" : " 从此能飞");
++		}
++		else if(verb == "teleport")
++		{
++			// cheatTeleport, but it says why when it can't, and takes the standing tile
++			const auto * h = currentHero();
++			const int3 tile(std::stoi(argument(command, 1, "x")), std::stoi(argument(command, 2, "y")),
++				command.size() > 3 ? std::stoi(command[3]) : h->visitablePos().z);
++			if(!gs.getMap().isInTheMap(tile))
++				throw std::runtime_error("坐标不在地图里");
++			const auto & destination = gs.getMap().getTile(tile);
++			const auto & here = gs.getMap().getTile(h->visitablePos());
++			if(!destination.isClear(&here))
++				throw std::runtime_error("那一格站不了人（有东西挡着，或者是水/岩石）");
++			if(!gameHandler->moveHero(h->id, h->convertFromVisitablePos(tile), EMovementMode::DIMENSION_DOOR))
++				throw std::runtime_error("传送没成功");
++			done = h->getNameTranslated() + " 传送到 (" + std::to_string(tile.x) + ", " + std::to_string(tile.y) + ", " + std::to_string(tile.z) + ")";
++		}
++		else
++			throw std::runtime_error("不认识的命令：" + verb);
++
++		logGlobal->info("Host command from %s: %s -> %s", player.toString(), boost::algorithm::join(command, " "), done);
++		broadcastSystemMessage("【Claude】" + done);
++	}
++	catch(const std::exception & e)
++	{
++		logGlobal->warn("Host command from %s failed: %s", player.toString(), e.what());
++		broadcastSystemMessage("【Claude】没办成：" + std::string(e.what()));
++	}
++	return true;
++}
+diff --git a/server/processors/PlayerMessageProcessor.h b/server/processors/PlayerMessageProcessor.h
+index 67dd6b8..e06da19 100644
+--- a/server/processors/PlayerMessageProcessor.h
++++ b/server/processors/PlayerMessageProcessor.h
+@@ -41,6 +41,8 @@ class PlayerMessageProcessor
+ 
+ 	void executeCheatCode(const std::string & cheatName, PlayerColor player, ObjectInstanceID currObj, const std::vector<std::string> & arguments );
+ 	bool handleCheatCode(const std::string & cheatFullCommand, PlayerColor player, ObjectInstanceID currObj);
++	/// H3 Mod local patch: "#host <key> ..." from Claude through the client's ClaudeBridge
++	bool handleHostCommand(PlayerColor player, const std::string & message, ObjectInstanceID currObj);
+ 	void handleCommand(PlayerColor player, const std::string & message);
+ 
+ 	void cheatGiveSpells(PlayerColor player, const CGHeroInstance * hero);

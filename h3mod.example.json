@@ -1,0 +1,19 @@
+{
+  "_comment": {
+    "about": "Copy this file to h3mod.local.json and edit the paths (forward slashes are fine). Each key can also be set by the environment variable named below, which wins over the file; leave a key out to use its default.",
+    "h3_game_dir": "Original Heroes 3 install, the folder with Data/ and Maps/; only ever read. Env H3_GAME_DIR. No default.",
+    "vcmi_dir": "Official VCMI install, the folder with VCMI_client.exe. Env VCMI_DIR. No default.",
+    "vcmi_data": "VCMI user data folder (Data, Maps, Mods, Saves, config, claude-bridge). Env VCMI_DATA. Default ~/Documents/My Games/vcmi.",
+    "vcmi_build_root": "Where the patched VCMI is cloned, built and installed (src, build, install, userdata...). Env VCMI_BUILD_ROOT. Default <repo>/build/vcmi.",
+    "vs_root": "Visual Studio 2022 install used by tools/vcmi_src/build.bat. Env VS_ROOT. Default: found with vswhere.",
+    "conan_home": "Conan cache for the VCMI build. Env CONAN_HOME. Default <vcmi_build_root>/conan.",
+    "dev_map": "Map that tools/vcmi_dev_client.py starts when no --map is given, as a VCMI resource name. Env H3MOD_DEV_MAP. No default."
+  },
+  "h3_game_dir": "C:/Games/Heroes3",
+  "vcmi_dir": "C:/Games/VCMI",
+  "vcmi_data": "~/Documents/My Games/vcmi",
+  "vcmi_build_root": "C:/dev/vcmi-build",
+  "vs_root": "C:/Program Files/Microsoft Visual Studio/2022/Community",
+  "conan_home": "C:/dev/vcmi-build/conan",
+  "dev_map": "Maps/my-test-map"
+}
